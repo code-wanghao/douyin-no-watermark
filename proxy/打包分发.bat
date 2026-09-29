@@ -6,7 +6,7 @@ rem Build a clean zip that can be handed to someone else.
 rem certs\ (machine-specific CA), logs\ and downloaded images are intentionally excluded.
 
 set "SRC=%~dp0"
-set "OUT=%~dp0douyin-nowm-proxy.zip"
+set "OUT=%~dp0douyin-no-watermark-proxy.zip"
 rem Avoid overriding system variables like TMP/TEMP - powershell fails to start
 set "PACKDIR=%TEMP%\dy-nowm-pack-%RANDOM%%RANDOM%"
 

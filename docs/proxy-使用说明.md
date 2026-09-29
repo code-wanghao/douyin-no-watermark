@@ -122,13 +122,13 @@
 1. `卸载根证书.bat` —— 移除根证书
 2. `恢复系统代理.bat` —— 还原代理设置
 
-然后把 `douyin-nowm` 整个目录删掉即可，不留残余。
+然后把 `douyin-no-watermark` 整个目录删掉即可，不留残余。
 
 ## 发给别人 / 换台电脑用
 
 ### 直接发这个包
 
-双击 `打包分发.bat`，会生成 `douyin-nowm-proxy.zip`（约 33 MB）。把它发给对方，解压后双击 `启动.bat` 即可。
+双击 `打包分发.bat`，会生成 `douyin-no-watermark-proxy.zip`（约 33 MB）。把它发给对方，解压后双击 `启动.bat` 即可。
 
 包里已经带了 `node\node.exe`，对方**不需要装 Node.js**。打包时会自动排除 `certs\`（每台机器自己生成的证书）、`logs\` 和下载的图片。
 

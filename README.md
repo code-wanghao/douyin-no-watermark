@@ -1,6 +1,6 @@
 # 抖音评论区图片 · 无水印原图（电脑版）
 
-[![Download](https://img.shields.io/badge/Download-Releases-brightgreen?style=flat-square)](https://github.com/code-wanghao/douyin-nowm/releases/latest)
+[![Download](https://img.shields.io/badge/Download-Releases-brightgreen?style=flat-square)](https://github.com/code-wanghao/douyin-no-watermark/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?style=flat-square)](#环境要求)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
@@ -91,8 +91,8 @@
 
 ### 1. 下载
 
-到 [Releases](https://github.com/code-wanghao/douyin-nowm/releases/latest) 下载
-`douyin-nowm-proxy.zip`，解压到任意目录（路径别带奇怪的符号就行）。
+到 [Releases](https://github.com/code-wanghao/douyin-no-watermark/releases/latest) 下载
+`douyin-no-watermark-proxy.zip`，解压到任意目录（路径别带奇怪的符号就行）。
 
 > 包里已经带了 Node.js 运行时，**不需要装任何东西**。
 
@@ -282,7 +282,7 @@ Chrome / Edge 里直接看网页版 `www.douyin.com` 的场景。
 1. 从 [nodejs.org](https://nodejs.org) 下载 Windows 版 Node.js 18+，把 `node.exe`
    放到 `proxy\node\` 目录（新建这个目录）
 2. 双击 `proxy\打包分发.bat`
-3. 生成 `proxy\douyin-nowm-proxy.zip`，这个包对方解压双击就能用
+3. 生成 `proxy\douyin-no-watermark-proxy.zip`，这个包对方解压双击就能用
 
 启动脚本查找运行时的顺序是：`proxy\node\node.exe` → 系统 PATH → 常见安装位置。
 
