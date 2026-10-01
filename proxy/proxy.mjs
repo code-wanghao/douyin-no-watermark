@@ -124,12 +124,14 @@ const FEATURE_DEFS = [
   {
     key: 'comment',
     name: '评论区图片去水印',
+    short: '评论区图片',
     desc: '点开评论图片看到的就是原图，可以只保存你点开过的那几张',
   },
   {
     key: 'aweme',
     name: '作品去水印',
-    desc: '保存视频 / 图文作品时，拿到的是无水印版本',
+    short: '作品下载',
+    desc: '视频 / 图文点"下载"存下来就是无水印版',
   },
 ];
 const FEATURE_KEYS = FEATURE_DEFS.map((f) => f.key);
@@ -271,6 +273,30 @@ const REG_PATH = String.raw`HKCU:\Software\Microsoft\Windows\CurrentVersion\Inte
 /* ============================ 基础工具 ============================ */
 
 const say = (msg) => process.stdout.write(msg + '\n');
+
+/** 控制台里中文是双宽字符，对齐要按"显示宽度"算，不能按字符个数 */
+function displayWidth(text) {
+  let w = 0;
+  for (const ch of String(text)) {
+    const c = ch.codePointAt(0);
+    const wide = (c >= 0x1100 && c <= 0x115f)
+      || (c >= 0x2e80 && c <= 0xa4cf)
+      || (c >= 0xac00 && c <= 0xd7a3)
+      || (c >= 0xf900 && c <= 0xfaff)
+      || (c >= 0xfe30 && c <= 0xfe6f)
+      || (c >= 0xff00 && c <= 0xff60)
+      || (c >= 0xffe0 && c <= 0xffe6)
+      || (c >= 0x1f300 && c <= 0x1f64f);
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+
+/** 把 text 补到指定显示宽度（至少留一个空格） */
+function padTo(text, width) {
+  const s = String(text);
+  return s + ' '.repeat(Math.max(1, width - displayWidth(s)));
+}
 /** 只写日志文件、不刷屏（追踪模式用） */
 const logOnly = (msg) => {
   if (!LOG_FILE) return;
@@ -317,12 +343,12 @@ async function askRaw(question) {
 
 /** 首次运行时让用户选要启用哪些功能，结果会存进 features.json */
 async function chooseFeatures() {
-  say('请选择要启用的功能（可多选，用逗号分隔，例如 1,2）：');
+  say('要启用哪些功能？');
   say('');
-  FEATURE_DEFS.forEach((f, i) => say(`  ${i + 1}. ${f.name}　—— ${f.desc}`));
+  FEATURE_DEFS.forEach((f, i) => say(`  ${i + 1}  ${padTo(f.name, 20)}${f.desc}`));
   say('');
   const all = Object.fromEntries(FEATURE_KEYS.map((k) => [k, true]));
-  const answer = (await askRaw('输入编号，直接回车＝两个都启用： ')).trim();
+  const answer = (await askRaw('输入编号（如 1,2），回车＝全部启用： ')).trim();
   if (!answer) return all;
 
   const picked = answer
@@ -331,11 +357,11 @@ async function chooseFeatures() {
     .filter((n) => Number.isInteger(n) && n >= 1 && n <= FEATURE_DEFS.length);
 
   if (!picked.length) {
-    say('没看懂输入，这次先按"两个都启用"处理；下次可以双击 选择功能.bat 重选。');
+    say('没看懂输入，这次先按全部启用处理（之后可双击 选择功能.bat 重选）。');
     return all;
   }
   const result = Object.fromEntries(FEATURE_DEFS.map((f, i) => [f.key, picked.includes(i + 1)]));
-  say(`已选择：${featuresToText(result)}（已记住，想改就双击 选择功能.bat）`);
+  say(`已选择：${featuresToText(result)}  （已记住，想改就双击 选择功能.bat）`);
   return result;
 }
 
@@ -345,9 +371,9 @@ function ensureCerts() {
   if (fs.existsSync(path.join(CERT_DIR, 'ca.pem')) && fs.existsSync(path.join(CERT_DIR, 'leaf.pem'))) {
     return loadCerts(CERT_DIR);
   }
-  say('首次运行，正在生成根证书和服务器证书...');
+  say('  正在生成证书…');
   const { thumbprint } = generateCerts(CERT_DIR);
-  say(`证书已生成（CA 指纹 ${thumbprint}）`);
+  logOnly(`证书已生成（CA 指纹 ${thumbprint}）`);
   return loadCerts(CERT_DIR);
 }
 
@@ -452,6 +478,11 @@ const originPathIndex = new Map();   // 原图的 URL 路径 -> uri，用来判�
 let rewriteCount = 0;
 let apiHits = 0;
 let traceSeq = 0;
+let worksSeen = 0;          // 识别到的作品数（视频/图文）
+const startedAt = Date.now();
+let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
+
+const VERSION = 'v1.2.0';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -743,20 +774,17 @@ async function downloadAll(records) {
       fs.writeFileSync(path.join(OUT_DIR, name), buf);
       ok++;
       // 顺手核对：拿到的到底是不是原始分辨率
+      // 尺寸只在"和接口声明对不上"时才提示，正常情况不刷屏
       const dim = imageSizeOf(buf);
       let note = '';
-      if (dim && dim.w) {
-        if (rec.width && rec.height) {
-          note = (dim.w === rec.width && dim.h === rec.height)
-            ? `  ${dim.w}x${dim.h} ${dim.fmt}  与接口原始尺寸一致 ✓`
-            : `  ${dim.w}x${dim.h} ${dim.fmt}  （接口声明 ${rec.width}x${rec.height}）`;
-        } else {
-          note = `  ${dim.w}x${dim.h} ${dim.fmt}`;
-        }
+      if (dim && dim.w && rec.width && rec.height && (dim.w !== rec.width || dim.h !== rec.height)) {
+        note = `  ⚠ ${dim.w}×${dim.h}（接口声明 ${rec.width}×${rec.height}）`;
       }
-      say(`  [${i + 1}/${records.length}] ${name}  ${(buf.length / 1024).toFixed(0)} KB${note}`);
+      const size = dim && dim.w ? `  ${dim.w}×${dim.h}` : '';
+      const tag = `${i + 1}/${records.length}`.padEnd(7);
+      say(`  ${tag}${name}${size}  ${(buf.length / 1024).toFixed(0)} KB${note}`);
     } catch (e) {
-      say(`  [${i + 1}/${records.length}] 失败 ${name} (${e.message})`);
+      say(`  ${`${i + 1}/${records.length}`.padEnd(7)}${name}  失败 (${e.message})`);
     }
   }
   say(`完成：${ok}/${records.length} 张`);
@@ -878,7 +906,7 @@ function handleInnerRequest(req, res) {
         const rec = images.get(hitUri);
         if (rec && !rec.opened) {
           rec.opened = true;
-          say(`  [点开] ${rec.author}${rec.text ? ' · ' + rec.text : ''}  (第 ${[...images.keys()].indexOf(hitUri) + 1} 张)`);
+          say(`  · 点开  ${rec.author}${rec.text ? ' · ' + rec.text : ''}`);
         }
         // 这张原图不要长期缓存：否则下次点开同一张时命中的是缓存、没有网络请求，"点开"就识别不出来了
         const headers = { ...upstreamRes.headers };
@@ -921,6 +949,7 @@ function handleInnerRequest(req, res) {
             const stats = rewriteAweme(json);
             changed += stats.fields;
             workCount = stats.works;
+            worksSeen += stats.works;
           }
           if (changed > 0) body = Buffer.from(JSON.stringify(json), 'utf8');
 
@@ -959,12 +988,18 @@ function handleInnerRequest(req, res) {
       res.writeHead(upstreamRes.statusCode, outHeaders);
       res.end(body);
 
-      const tag = changed
-        ? `改写 ${changed} 个字段`
-          + (imgCount ? ` / ${imgCount} 张评论图` : '')
-          + (workCount ? ` / ${workCount} 个作品` : '')
-        : '无需改写';
-      say(`  [接口] ${kind}  ${tag}  累计原图 ${images.size} 张 (${Date.now() - started}ms)`);
+      // 控制台只说人话；技术明细（字段数、耗时、kind）都进日志
+      logOnly(`[接口] ${kind} 改写 ${changed} 个字段`
+        + (imgCount ? ` / ${imgCount} 张评论图` : '')
+        + (workCount ? ` / ${workCount} 个作品` : '')
+        + `  累计原图 ${images.size} 张 / 作品 ${worksSeen} 个 (${Date.now() - started}ms)`);
+
+      if (idleNotice) {
+        idleNotice = false;
+        say('  · 已接通');
+      }
+      if (imgCount) say(`  · 抓到 ${imgCount} 张评论图（累计 ${images.size}）`);
+      if (workCount) say(`  · 识别到 ${workCount} 个作品（累计 ${worksSeen}）`);
     });
   });
 
@@ -1069,14 +1104,14 @@ async function main() {
 
   // 只做功能选择，不启动代理（给 选择功能.bat 用）
   if (has('--choose-only')) {
-    say('抖音评论区 · 图片/作品去水印代理 —— 功能选择');
+    say('抖音去水印代理 · 功能选择');
     say('');
     const picked = await chooseFeatures();
     saveFeatureConfig(picked);
     say('');
     say(`已保存：${featuresToText(picked)}`);
-    say(`配置文件：${CONFIG_FILE}`);
-    say('下次双击 启动.bat 就按这个设置运行。');
+    say('下次双击 启动.bat 生效。');
+    logOnly(`[功能] 配置文件=${CONFIG_FILE}`);
     return 0;
   }
 
@@ -1104,40 +1139,33 @@ async function main() {
     }
   }
 
-  say('抖音评论区 · 图片/作品去水印代理');
-  say(`运行日志：${LOG_FILE || '(未能创建日志文件)'}`);
-  say(`[功能] 已启用：${featuresToText(FEATURES)}`);
+  // 界面只留人话；下面这些技术信息全部只进日志文件，方便出问题时排查
+  say(`抖音去水印代理  ${VERSION}`);
+  say('');
+  logOnly(`[环境] 注册表图片文件夹=${knownPicturesDir() || '(读不到)'}`);
+  logOnly(`[环境] node=${process.version}`);
+  logOnly(`[环境] exe=${process.execPath}`);
+  logOnly(`[环境] script=${fileURLToPath(import.meta.url)}`);
+  logOnly(`[环境] cwd=${process.cwd()}`);
+  logOnly(`[环境] platform=${process.platform} arch=${process.arch}`);
+  logOnly(`[环境] stdin.isTTY=${process.stdin.isTTY} stdout.isTTY=${process.stdout.isTTY}`);
+  logOnly(`[环境] 追踪模式=${TRACE ? '开' : '关'}`);
+  logOnly(`[环境] 功能=${FEATURE_KEYS.filter((k) => FEATURES[k]).join(',') || '(全关)'}`);
+  logOnly(`[环境] 运行日志=${LOG_FILE || '(未能创建日志文件)'}`);
+
   if (!FEATURE_KEYS.some((k) => FEATURES[k])) {
-    say('[功能] 警告：一个功能都没启用，代理只会转发流量、不做任何改写。');
-    say('[功能] 想重选：双击 选择功能.bat，或者启动时加 --features comment,aweme');
+    say('提示：当前一个功能都没启用，只会转发流量、不做改写。');
+    say('      想重选就双击 选择功能.bat。');
+    say('');
   }
-  say('');
-  say('[环境] 注册表图片文件夹=' + (knownPicturesDir() || '(读不到)'));
-  say('[环境] node=' + process.version);
-  say('[环境] exe=' + process.execPath);
-  say('[环境] script=' + fileURLToPath(import.meta.url));
-  say('[环境] cwd=' + process.cwd());
-  say('[环境] platform=' + process.platform + ' arch=' + process.arch);
-  say('[环境] stdin.isTTY=' + process.stdin.isTTY + ' stdout.isTTY=' + process.stdout.isTTY);
-  say('[环境] 追踪模式=' + (TRACE ? '开（会记录每一次图片请求）' : '关'));
-  say('');
 
   const picked = pickDownloadDir();
   OUT_DIR = picked.dir;
-  if (picked.tried.length) {
-    say('[下载] 这些目录不可写，已跳过：' + picked.tried.join(' / '));
-  }
-  if (OUT_DIR) {
-    say(`[下载] 原图将保存到：${OUT_DIR}`);
-  } else {
-    say('[下载] 没有找到可写目录。');
-    say('[下载] 改写功能不受影响（客户端里仍然是无水印图），只是最后不能自动下载。');
-    say('[下载] 想自动下载就指定一个可写目录，例如：启动.bat -o D:\\downloads\\douyin');
-  }
-  say('');
+  if (picked.tried.length) logOnly('[下载] 这些目录不可写，已跳过：' + picked.tried.join(' / '));
+  logOnly(`[下载] 保存目录=${OUT_DIR || '(没有找到可写目录)'}`);
 
   const certs = ensureCerts();
-  say('[环境] 证书指纹=' + certs.thumbprint);
+  logOnly('[环境] 证书指纹=' + certs.thumbprint);
 
   if (has('--install-ca')) {
     const r = installCa(path.join(CERT_DIR, 'ca.cer'));
@@ -1157,14 +1185,15 @@ async function main() {
   }
 
   if (DEV) {
-    say('[dev] 跳过证书信任检查和系统代理设置。');
+    logOnly('[dev] 跳过证书信任检查和系统代理设置。');
   } else if (!isCaTrusted(certs.thumbprint)) {
-    say('[环境] 根证书当前状态：未受信任');
-    say('根证书还没装进系统信任区，不装的话抖音看不懂我们伪造的证书，代理起不到作用。');
-    say('（这个证书只存在你本机，私钥也只在 certs 目录里；不想要了随时用"卸载根证书.bat"移除。）');
-    const yes = await ask('现在安装根证书吗？会弹出一次 Windows 安全警告，选"是"。(Y/n，直接回车＝安装) ', true);
+    logOnly('[环境] 根证书当前状态：未受信任');
+    say('首次使用需要装一个本地根证书（用来解密抖音的 HTTPS）。');
+    say('证书只在本机生成、不外传，不想用了双击 卸载根证书.bat 即可。');
+    say('');
+    const yes = await ask('现在安装吗？稍后 Windows 会弹安全警告，请点"是"。 (Y/n) ', true);
     if (!yes) {
-      say('已取消。可以稍后运行：node proxy.mjs --install-ca');
+      say('已取消。可以稍后双击 安装根证书.bat。');
       return 1;
     }
     const r = installCa(path.join(CERT_DIR, 'ca.cer'));
@@ -1172,9 +1201,10 @@ async function main() {
       say('安装失败：' + (r.err || r.out));
       return 1;
     }
-    say('根证书已安装。');
+    say('证书已装好。');
+    say('');
   } else {
-    say('[环境] 根证书状态：已受信任');
+    logOnly('[环境] 根证书状态：已受信任');
   }
 
   // 先监听，确认拿到一个真能用的端口，再去动系统代理。
@@ -1189,10 +1219,8 @@ async function main() {
   }
   const proxy = bound.proxy;
   const port = bound.port;
-  say(`[代理] 已监听 127.0.0.1:${port}`);
-  if (port !== PORT) {
-    say(`[代理] 端口 ${PORT} 在这台机器上被拒绝（EACCES），已自动改用 ${port}。`);
-  }
+  logOnly(`[代理] 已监听 127.0.0.1:${port}`);
+  if (port !== PORT) logOnly(`[代理] 端口 ${PORT} 被拒绝（EACCES），已自动改用 ${port}`);
 
   // 再接管系统代理
   if (!DEV) {
@@ -1201,43 +1229,39 @@ async function main() {
       fs.writeFileSync(BACKUP_FILE, JSON.stringify(readProxySettings(), null, 2), 'utf8');
     }
     const applied = applyProxy(`127.0.0.1:${port}`);
-    say('[代理] 写入结果 ok=' + applied.ok + ' out=' + applied.out + ' err=' + applied.err);
+    logOnly(`[代理] 写入结果 ok=${applied.ok} out=${applied.out} err=${applied.err}`);
     if (!applied.ok) {
-      say('设置系统代理失败：' + (applied.err || applied.out));
-      say('可以手动设置：Windows 设置 → 网络和 Internet → 代理 → 手动设置代理 → 127.0.0.1:' + port);
+      say('系统代理设置失败：' + (applied.err || applied.out));
+      say('可手动设置：Windows 设置 → 网络和 Internet → 代理 → 127.0.0.1:' + port);
+      say('');
     } else {
       proxyApplied = true;
-      say(`系统代理已指向 127.0.0.1:${port}`);
       startWatchdog();   // 万一本进程被强杀，由看门狗把代理设置还原
     }
   }
+  // ---- 运行状态卡片（这是用户唯一需要看的东西）----
   say('');
-  say('代理已启动。接下来：');
-  let step = 1;
-  say(`  ${step++}. 回到抖音电脑版，切到目标视频，让它重新加载一次（划走再点回来即可）；`);
-  if (FEATURES.comment) {
-    say(`  ${step++}. 点开评论图片看到的就是原图；点保存存下来的也是原图；`);
-  }
-  if (FEATURES.aweme) {
-    say(`  ${step++}. 视频/图文点"下载"存下来的就是无水印版本；`);
-  }
-  say(`  ${step++}. 用完回到这个窗口，直接按【回车】结束（或输入 q 再回车）。`);
+  const enabled = FEATURE_DEFS.filter((f) => FEATURES[f.key]);
+  say(`  ${padTo('功能', 8)}${enabled.length ? enabled.map((f) => f.short).join(' · ') : '（全关）'}`);
+  say(`  ${padTo('端口', 8)}127.0.0.1:${port}`);
+  if (FEATURES.comment && OUT_DIR) say(`  ${padTo('存档', 8)}${OUT_DIR}`);
   say('');
-  say('注意：不要按 Ctrl+C。在 .bat 里按 Ctrl+C 会先弹出 cmd 自己的');
-  say('"终止批处理操作吗(Y/N)?"，选 Y 会把整个窗口关掉，脚本就没机会还原代理了。');
+  say('  在抖音里重新加载一下内容，然后点开图片 / 点下载就行。');
+  say('  结束时回到本窗口按【回车】（别按 Ctrl+C，那是直接关窗口的）。');
   say('');
 
   let stopping = false;
   // 启动后到抓到第一张图之间是静默的，容易让人以为卡死。
   // 定期报一次状态，顺便提醒怎么收尾。
   const heartbeat = setInterval(() => {
-    const found = images.size;
-    if (!FEATURES.comment) {
-      say(`[状态] 运行中，已改写 ${rewriteCount} 个字段（看到 ${apiHits} 次接口响应）。结束后按回车。`);
-    } else if (found === 0) {
-      say('[状态] 还没抓到评论原图。确认抖音里已经打开视频、并把评论区展开（划走再点回来）。');
+    const parts = [];
+    if (FEATURES.comment) parts.push(`评论图 ${images.size}`);
+    if (FEATURES.aweme) parts.push(`作品 ${worksSeen}`);
+    if (apiHits === 0) {
+      idleNotice = true;
+      say('  · 等待中… 请先在抖音里打开视频、重新加载一次内容');
     } else {
-      say(`[状态] 已采集 ${found} 张原图（看到 ${apiHits} 次评论接口响应）。结束后按回车。`);
+      say(`  · 运行中 · ${parts.join(' · ')}`);
     }
   }, 20000);
 
@@ -1255,21 +1279,23 @@ async function main() {
     say('');
     say('正在收尾...');
     try { proxy.close(); } catch { /* ignore */ }
-    if (!DEV) say(restoreProxyFromBackup());
+    if (!DEV) logOnly(restoreProxyFromBackup());
     proxyApplied = false;
-    say(`本次共看到 ${apiHits} 次评论接口响应，改写 ${rewriteCount} 个字段，采集到 ${images.size} 张原图。`);
-    if (images.size) {
+    say('系统代理已还原');
+    logOnly(`[汇总] 接口响应 ${apiHits} 次 · 改写 ${rewriteCount} 个字段 · 评论图 ${images.size} 张 · 作品 ${worksSeen} 个`);
+    if (FEATURES.comment && images.size) {
       const all = [...images.values()];
       const opened = all.filter((r) => r.opened);
-      say(`采集到 ${all.length} 张原图，其中你在客户端里点开过 ${opened.length} 张。`);
+      say('');
+      say(`评论图  采到 ${all.length} 张，其中你点开过 ${opened.length} 张`);
       if (opened.length) {
-        say('你点开过的是：');
         opened.slice(0, 20).forEach((r, i) => {
           say(`  ${i + 1}. ${r.author}${r.text ? ' · ' + r.text : ''}`);
         });
         if (opened.length > 20) say(`  …还有 ${opened.length - 20} 张`);
       }
-      const answer = (await askRaw('下载哪些？ y=只下载你点开的 / a=全部 / 直接回车=不下载： ')).trim().toLowerCase();
+      say('');
+      const answer = (await askRaw('下载哪些？  y=只下载点开的   a=全部   回车=不下载： ')).trim().toLowerCase();
       const target = /^a/.test(answer) ? all : (/^y/.test(answer) ? opened : null);
       if (target && target.length) {
         try {
@@ -1281,9 +1307,16 @@ async function main() {
           for (const r of target) say('  ' + r.url);
         }
       } else if (/^y/.test(answer)) {
-        say('这次没有点开过任何评论图片，所以没有可下载的。');
+        say('这次没有点开过任何评论图片，没有可下载的。');
       }
+    } else if (FEATURES.aweme && worksSeen) {
+      say('');
+      say(`作品  识别到 ${worksSeen} 个（在客户端里点"下载"存下来的就是无水印版）`);
+    } else if (!FEATURES.comment && !FEATURES.aweme) {
+      say('');
+      say('两个功能都没启用，本次没有做任何改写。');
     }
+    say('');
     say('已退出。');
     process.exit(0);
   };
