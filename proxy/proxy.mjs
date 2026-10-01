@@ -1102,6 +1102,12 @@ async function bindProxy(certs, preferredPort, autoPick) {
 async function main() {
   if (WATCHDOG_PID) return runWatchdog(WATCHDOG_PID);
 
+  // 版本号按需查看：启动.bat --version
+  if (has('--version') || has('-v')) {
+    say(`抖音去水印代理 ${VERSION}`);
+    return 0;
+  }
+
   // 只做功能选择，不启动代理（给 选择功能.bat 用）
   if (has('--choose-only')) {
     say('抖音去水印代理 · 功能选择');
@@ -1140,8 +1146,9 @@ async function main() {
   }
 
   // 界面只留人话；下面这些技术信息全部只进日志文件，方便出问题时排查
-  say(`抖音去水印代理  ${VERSION}`);
+  say('抖音去水印代理');
   say('');
+  logOnly(`[环境] 版本=${VERSION}`);
   logOnly(`[环境] 注册表图片文件夹=${knownPicturesDir() || '(读不到)'}`);
   logOnly(`[环境] node=${process.version}`);
   logOnly(`[环境] exe=${process.execPath}`);
@@ -1243,11 +1250,10 @@ async function main() {
   say('');
   const enabled = FEATURE_DEFS.filter((f) => FEATURES[f.key]);
   say(`  ${padTo('功能', 8)}${enabled.length ? enabled.map((f) => f.short).join(' · ') : '（全关）'}`);
-  say(`  ${padTo('端口', 8)}127.0.0.1:${port}`);
   if (FEATURES.comment && OUT_DIR) say(`  ${padTo('存档', 8)}${OUT_DIR}`);
   say('');
-  say('  在抖音里重新加载一下内容，然后点开图片 / 点下载就行。');
-  say('  结束时回到本窗口按【回车】（别按 Ctrl+C，那是直接关窗口的）。');
+  say('  去抖音里重新加载一下内容，然后点开图片 / 点下载。');
+  say('  结束后按【回车】收尾（别按 Ctrl+C，那是关窗口）。');
   say('');
 
   let stopping = false;
