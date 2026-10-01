@@ -131,13 +131,7 @@ const FEATURE_DEFS = [
     key: 'aweme',
     name: '作品去水印',
     short: '作品去水印',
-    desc: '视频 / 图文点"下载"存下来就是无水印版',
-  },
-  {
-    key: 'unlock',
-    name: '解除下载限制',
-    short: '解除限制',
-    desc: '作者关了下载时，把灰掉的下载按钮变回可点',
+    desc: '视频 / 图文点"下载"就是无水印版；作者关了下载时自动把灰按钮变回可点',
   },
   {
     key: 'pick',
@@ -154,7 +148,9 @@ let FEATURES = Object.fromEntries(FEATURE_KEYS.map((k) => [k, true]));
 function loadFeatureConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    const list = Array.isArray(raw.features) ? raw.features : [];
+    const list = Array.isArray(raw.features) ? raw.features.slice() : [];
+    // 兼容旧配置：unlock 已经并入 aweme
+    if (list.includes('unlock') && !list.includes('aweme')) list.push('aweme');
     if (!list.length) return null;
     const picked = Object.fromEntries(FEATURE_KEYS.map((k) => [k, list.includes(k)]));
     if (!FEATURE_KEYS.some((k) => picked[k])) return null;
@@ -184,6 +180,8 @@ function parseFeatureArg(value) {
   if (!t || t === 'all') return allTrue();
   if (t === 'none') return allFalse();
   const parts = t.split(/[,，\s]+/).filter(Boolean);
+  // 兼容旧写法：--features unlock 等价于 aweme
+  if (parts.includes('unlock') && !parts.includes('aweme')) parts.push('aweme');
   const picked = Object.fromEntries(FEATURE_KEYS.map((k) => [k, parts.includes(k)]));
   return FEATURE_KEYS.some((k) => picked[k]) ? picked : null;
 }
@@ -494,6 +492,7 @@ let rewriteCount = 0;
 let apiHits = 0;
 let traceSeq = 0;
 let worksSeen = 0;          // 识别到的作品数（视频/图文）
+let unlockedTotal = 0;      // 其中原本禁止下载、被自动解除的个数
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
@@ -629,6 +628,7 @@ function pickCleanVideoSource(video) {
 function rewriteAweme(json) {
   let fields = 0;
   let workCount = 0;
+  let unlocked = 0;
   const seen = new Set();
   const stack = [json];
 
@@ -690,8 +690,8 @@ function rewriteAweme(json) {
       }
     }
 
-    // ---- 解锁下载限制 ----
-    if (FEATURES.unlock) {
+    // ---- 解除下载限制（并入"作品去水印"；只在真的被限制时才动）----
+    if (FEATURES.aweme) {
       let n = 0;
       if (node.prevent_download) {
         node.prevent_download = false;
@@ -711,6 +711,7 @@ function rewriteAweme(json) {
       if (n) {
         fields += n;
         workCount++;
+        unlocked++;
       }
     }
 
@@ -720,7 +721,7 @@ function rewriteAweme(json) {
     }
   }
 
-  return { fields, works: workCount };
+  return { fields, works: workCount, unlocked };
 }
 
 /** 记下一个作品的干净地址（只记地址，不下载任何东西） */
@@ -1021,7 +1022,7 @@ function shouldMitm(host) {
  */
 function classifyEndpoint(pathname) {
   if (FEATURES.comment && COMMENT_API_RE.test(pathname)) return 'comment';
-  const awemeWanted = FEATURES.aweme || FEATURES.unlock || FEATURES.pick;
+  const awemeWanted = FEATURES.aweme || FEATURES.pick;
   if (awemeWanted && /^\/aweme\//.test(pathname) && !COMMENT_API_RE.test(pathname)) return 'aweme';
   return '';
 }
@@ -1155,11 +1156,15 @@ function handleInnerRequest(req, res) {
             changed += stats.fields;
             imgCount = stats.imgs;
           }
-          if (FEATURES.aweme || FEATURES.unlock || FEATURES.pick) {
+          if (FEATURES.aweme || FEATURES.pick) {
             const stats = rewriteAweme(json);
             changed += stats.fields;
             workCount = stats.works;
             worksSeen += stats.works;
+            if (stats.unlocked) {
+              unlockedTotal += stats.unlocked;
+              logOnly(`[解锁] 这段响应里有 ${stats.unlocked} 处原本禁止下载，已自动解除`);
+            }
           }
           if (changed > 0) body = Buffer.from(JSON.stringify(json), 'utf8');
 
@@ -1526,6 +1531,9 @@ async function main() {
         say(`  ${i + 1}. ${r.author}${r.desc ? ' · ' + r.desc : ''}   (${kind})`);
       });
       if (pickedWorks.length > 20) say(`  …还有 ${pickedWorks.length - 20} 个`);
+    }
+    if (unlockedTotal) {
+      logOnly(`[解锁] 本次共自动解除 ${unlockedTotal} 处"禁止下载"限制`);
     }
 
     if (openedImgs.length + pickedWorks.length > 0) {
