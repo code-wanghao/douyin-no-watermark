@@ -130,8 +130,20 @@ const FEATURE_DEFS = [
   {
     key: 'aweme',
     name: '作品去水印',
-    short: '作品下载',
+    short: '作品去水印',
     desc: '视频 / 图文点"下载"存下来就是无水印版',
+  },
+  {
+    key: 'unlock',
+    name: '解除下载限制',
+    short: '解除限制',
+    desc: '作者关了下载时，把灰掉的下载按钮变回可点',
+  },
+  {
+    key: 'pick',
+    name: '点赞/收藏即标记',
+    short: '点赞收藏',
+    desc: '你点赞或收藏过的作品会被记下，结束时可下载',
   },
 ];
 const FEATURE_KEYS = FEATURE_DEFS.map((f) => f.key);
@@ -268,6 +280,8 @@ function startWatchdog() {
 }
 
 const COMMENT_API_RE = /\/aweme\/v1\/web\/comment\/(list|list\/reply)/;
+// 点赞 / 收藏动作接口（用来当"我要这个作品"的触发器）
+const PICK_API_RE = /\/commit\/item\/digg|\/aweme\/collect/;
 const REG_PATH = String.raw`HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings`;
 
 /* ============================ 基础工具 ============================ */
@@ -475,6 +489,7 @@ function restoreProxyFromBackup() {
 
 const images = new Map();   // uri -> record
 const originPathIndex = new Map();   // 原图的 URL 路径 -> uri，用来判定"这张被点开了"
+const works = new Map();    // aweme_id -> record（只存地址和元信息，不存文件）
 let rewriteCount = 0;
 let apiHits = 0;
 let traceSeq = 0;
@@ -605,9 +620,15 @@ function pickCleanVideoSource(video) {
   return null;
 }
 
+/*
+ * 处理作品（视频 / 图文）。三件事，各自受功能开关控制：
+ *   1) 收集  —— 只把干净地址记下来（几百字节），全程不下载任何文件
+ *   2) 去水印 —— 把下载专用字段指向播放地址（客户端点"下载"就是干净版）
+ *   3) 解锁   —— 把 allow_download 等标志位改开（作者关了下载时，灰按钮变可点）
+ */
 function rewriteAweme(json) {
   let fields = 0;
-  let works = 0;
+  let workCount = 0;
   const seen = new Set();
   const stack = [json];
 
@@ -616,11 +637,17 @@ function rewriteAweme(json) {
     if (!node || typeof node !== 'object' || seen.has(node)) continue;
     seen.add(node);
 
+    // ---- 收集：识别"这是个作品"并记下干净地址 ----
+    const awemeId = node.aweme_id || node.awemeId || '';
+    if (awemeId && (node.video || Array.isArray(node.images))) {
+      collectWork(node, awemeId);
+    }
+
     // ---- 视频 ----
     const video = node.video;
     if (video && typeof video === 'object') {
       const clean = pickCleanVideoSource(video);
-      if (clean) {
+      if (clean && FEATURES.aweme) {
         let n = 0;
         for (const field of ['download_addr', 'download_suffix_logo_addr', 'download_addr_265']) {
           if (video[field]) {
@@ -644,20 +671,46 @@ function rewriteAweme(json) {
         }
         if (n) {
           fields += n;
-          works++;
+          workCount++;
         }
       }
     }
 
     // ---- 图文图片列表（评论图片走各自的分支）----
-    for (const key of ['images', 'image_list']) {
-      const arr = node[key];
-      if (!Array.isArray(arr)) continue;
+    if (FEATURES.aweme) {
+      for (const key of ['images', 'image_list']) {
+        const arr = node[key];
+        if (!Array.isArray(arr)) continue;
+        let n = 0;
+        for (const im of arr) n += rewriteOneImage(im);
+        if (n) {
+          fields += n;
+          workCount++;
+        }
+      }
+    }
+
+    // ---- 解锁下载限制 ----
+    if (FEATURES.unlock) {
       let n = 0;
-      for (const im of arr) n += rewriteOneImage(im);
+      if (node.prevent_download) {
+        node.prevent_download = false;
+        n++;
+      }
+      const vc = node.video_control;
+      if (vc && typeof vc === 'object') {
+        if (vc.allow_download === false) {
+          vc.allow_download = true;
+          n++;
+        }
+        if (vc.download_info && typeof vc.download_info === 'object' && vc.download_info.level !== 0) {
+          vc.download_info.level = 0;
+          n++;
+        }
+      }
       if (n) {
         fields += n;
-        works++;
+        workCount++;
       }
     }
 
@@ -667,7 +720,61 @@ function rewriteAweme(json) {
     }
   }
 
-  return { fields, works };
+  return { fields, works: workCount };
+}
+
+/** 记下一个作品的干净地址（只记地址，不下载任何东西） */
+function collectWork(node, awemeId) {
+  if (!FEATURES.aweme && !FEATURES.pick) return;
+  let rec = works.get(awemeId);
+  if (!rec) {
+    rec = {
+      awemeId,
+      desc: '',
+      author: '',
+      videoUrl: '',
+      imageUrls: [],
+      picked: false,
+      pickKind: '',
+    };
+    works.set(awemeId, rec);
+  }
+
+  const video = node.video;
+  if (video && typeof video === 'object' && !rec.videoUrl) {
+    const clean = pickCleanVideoSource(video);
+    if (clean) rec.videoUrl = clean.url;
+  }
+  if (Array.isArray(node.images) && !rec.imageUrls.length) {
+    for (const im of node.images) {
+      const u = pickCleanImageUrl(im);
+      if (u) rec.imageUrls.push(u);
+    }
+  }
+  if (!rec.author) rec.author = node.author?.nickname || node.author?.unique_id || '';
+  if (!rec.desc) rec.desc = String(node.desc || '').replace(/\s+/g, ' ').slice(0, 40);
+}
+
+/** 点赞 / 收藏 → 把这个作品标记为"我要的" */
+function markPicked(awemeId, pathname, params) {
+  if (!FEATURES.pick || !awemeId) return;
+  const kind = /digg/.test(pathname) ? '点赞' : '收藏';
+  const type = params.get('type');
+  const action = params.get('action');
+  const cancel = type === '0' || action === '0';
+
+  let rec = works.get(awemeId);
+  if (!rec) {
+    rec = { awemeId, desc: '', author: '', videoUrl: '', imageUrls: [], picked: false, pickKind: '' };
+    works.set(awemeId, rec);
+  }
+  rec.picked = !cancel;
+  rec.pickKind = cancel ? '' : kind;
+  logOnly(`[标记] ${cancel ? '取消' + kind : kind} aweme_id=${awemeId} type=${type ?? '-'} action=${action ?? '-'}`);
+  if (!cancel) {
+    const who = [rec.author, rec.desc].filter(Boolean).join(' · ');
+    say(`  · 标记  ${kind}：${who || awemeId}`);
+  }
 }
 
 /** 把评论 JSON 里"带水印图"的字段替换成 origin_url 的深拷贝。 */
@@ -788,10 +895,101 @@ async function downloadAll(records) {
     }
   }
   say(`完成：${ok}/${records.length} 张`);
-  say(`文件在这个文件夹里（马上帮你打开）：${OUT_DIR}`);
+  return ok;
+}
+
+/** 下载单个文件到磁盘；视频可能几十 MB，所以带进度回调 */
+async function downloadToFile(url, file, onProgress) {
+  const res = await fetch(url, {
+    headers: { Referer: 'https://www.douyin.com/', 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(180000),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const total = Number(res.headers.get('content-length')) || 0;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+
+  const out = fs.createWriteStream(file);
+  let got = 0;
   try {
-    spawn('explorer.exe', [OUT_DIR], { detached: true, stdio: 'ignore' }).unref();
-  } catch { /* 打不开就算了 */ }
+    for await (const chunk of res.body) {
+      got += chunk.length;
+      if (!out.write(chunk)) await new Promise((r) => out.once('drain', r));
+      if (onProgress) onProgress(got, total);
+    }
+  } finally {
+    await new Promise((r) => out.end(r));
+  }
+  return got;
+}
+
+/**
+ * 下载作品（视频 / 图文）。这一步才是真正走流量的时候，而且只下你标记过的那些。
+ * 视频动辄几十 MB，所以每张 25% 报一次进度，避免长时间没反馈。
+ */
+async function downloadWorks(records) {
+  if (!OUT_DIR) {
+    say('没有可写目录，改为把地址打印出来：');
+    for (const r of records) {
+      if (r.videoUrl) say('  ' + r.videoUrl);
+      for (const u of r.imageUrls) say('  ' + u);
+    }
+    return 0;
+  }
+  const videoDir = path.join(OUT_DIR, '视频');
+  const imageDir = path.join(OUT_DIR, '图文');
+  let ok = 0;
+
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    const tag = `${i + 1}/${records.length}`.padEnd(7);
+    const who = sanitize(rec.author || '未知作者');
+    const what = sanitize(rec.desc || rec.awemeId);
+
+    // ---- 图文：一个作品一个文件夹 ----
+    if (rec.imageUrls.length) {
+      const folder = path.join(imageDir, `${who}_${what}`);
+      let n = 0;
+      for (let k = 0; k < rec.imageUrls.length; k++) {
+        const file = path.join(folder, `${String(k + 1).padStart(2, '0')}.${extOf(rec.imageUrls[k])}`);
+        try {
+          await downloadToFile(rec.imageUrls[k], file);
+          n++;
+        } catch (e) {
+          logOnly(`[下载] 第 ${k + 1} 张失败：${e.message}`);
+        }
+      }
+      say(`  ${tag}${who} · 图文  ${n}/${rec.imageUrls.length} 张`);
+      if (n) ok++;
+      continue;
+    }
+
+    // ---- 视频 ----
+    if (rec.videoUrl) {
+      const name = `${who}_${what}.mp4`;
+      const file = path.join(videoDir, name);
+      let lastStep = 0;
+      try {
+        const size = await downloadToFile(rec.videoUrl, file, (got, total) => {
+          if (!total) return;
+          const step = Math.floor((got / total) * 4);   // 每 25% 报一次
+          if (step > lastStep) {
+            lastStep = step;
+            say(`  ${tag}${name}  ${step * 25}%`);
+          }
+        });
+        say(`  ${tag}${name}  ${(size / 1048576).toFixed(1)} MB`);
+        ok++;
+      } catch (e) {
+        say(`  ${tag}${name}  失败（${e.message}）`);
+        logOnly(`[下载] 视频失败：${rec.videoUrl}`);
+      }
+      continue;
+    }
+
+    say(`  ${tag}${who}_${what}  没有可用地址`);
+    logOnly(`[下载] aweme_id=${rec.awemeId} 没有可用地址`);
+  }
+  return ok;
 }
 
 /* ============================ 代理本体 ============================ */
@@ -823,7 +1021,8 @@ function shouldMitm(host) {
  */
 function classifyEndpoint(pathname) {
   if (FEATURES.comment && COMMENT_API_RE.test(pathname)) return 'comment';
-  if (FEATURES.aweme && /^\/aweme\//.test(pathname) && !COMMENT_API_RE.test(pathname)) return 'aweme';
+  const awemeWanted = FEATURES.aweme || FEATURES.unlock || FEATURES.pick;
+  if (awemeWanted && /^\/aweme\//.test(pathname) && !COMMENT_API_RE.test(pathname)) return 'aweme';
   return '';
 }
 
@@ -858,6 +1057,17 @@ function handleInnerRequest(req, res) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) headers[k] = v;
+  }
+
+  // 点赞 / 收藏动作 —— 直接把那个作品标记为"我要的"（只记标记，不下载）
+  if (FEATURES.pick && PICK_API_RE.test(target.pathname)) {
+    try {
+      markPicked(
+        target.searchParams.get('aweme_id') || target.searchParams.get('item_id') || '',
+        target.pathname,
+        target.searchParams,
+      );
+    } catch { /* 参数解析失败就算了 */ }
   }
 
   const up = upstreamFor(target.hostname, Number(target.port) || 443);
@@ -945,7 +1155,7 @@ function handleInnerRequest(req, res) {
             changed += stats.fields;
             imgCount = stats.imgs;
           }
-          if (FEATURES.aweme) {
+          if (FEATURES.aweme || FEATURES.unlock || FEATURES.pick) {
             const stats = rewriteAweme(json);
             changed += stats.fields;
             workCount = stats.works;
@@ -1252,7 +1462,11 @@ async function main() {
   say(`  ${padTo('功能', 8)}${enabled.length ? enabled.map((f) => f.short).join(' · ') : '（全关）'}`);
   if (FEATURES.comment && OUT_DIR) say(`  ${padTo('存档', 8)}${OUT_DIR}`);
   say('');
-  say('  去抖音里重新加载一下内容，然后点开图片 / 点下载。');
+  const hints = [];
+  if (FEATURES.comment) hints.push('点开评论图');
+  if (FEATURES.aweme || FEATURES.unlock) hints.push('点作品的下载');
+  if (FEATURES.pick) hints.push('点赞或收藏');
+  say(`  去抖音里重新加载一次内容；然后 ${hints.length ? hints.join(' / ') : '随便看看'} 都可以。`);
   say('  结束后按【回车】收尾（别按 Ctrl+C，那是关窗口）。');
   say('');
 
@@ -1261,13 +1475,14 @@ async function main() {
   // 定期报一次状态，顺便提醒怎么收尾。
   const heartbeat = setInterval(() => {
     const parts = [];
-    if (FEATURES.comment) parts.push(`评论图 ${images.size}`);
-    if (FEATURES.aweme) parts.push(`作品 ${worksSeen}`);
+    // 只报"标记过的"数量，刷到但没点开/没标记的不算
+    if (FEATURES.comment) parts.push(`评论图 ${[...images.values()].filter((r) => r.opened).length}`);
+    if (FEATURES.pick) parts.push(`作品 ${[...works.values()].filter((r) => r.picked).length}`);
     if (apiHits === 0) {
       idleNotice = true;
       say('  · 等待中… 请先在抖音里打开视频、重新加载一次内容');
     } else {
-      say(`  · 运行中 · ${parts.join(' · ')}`);
+      say(`  · 运行中${parts.length ? ' · ' + parts.join(' · ') : ''}`);
     }
   }, 20000);
 
@@ -1288,39 +1503,55 @@ async function main() {
     if (!DEV) logOnly(restoreProxyFromBackup());
     proxyApplied = false;
     say('系统代理已还原');
-    logOnly(`[汇总] 接口响应 ${apiHits} 次 · 改写 ${rewriteCount} 个字段 · 评论图 ${images.size} 张 · 作品 ${worksSeen} 个`);
-    if (FEATURES.comment && images.size) {
-      const all = [...images.values()];
-      const opened = all.filter((r) => r.opened);
+    // 「刷到的不统计」——只列用户明确标记过的：点开的评论图 + 点赞/收藏的作品
+    const openedImgs = [...images.values()].filter((r) => r.opened);
+    const pickedWorks = [...works.values()].filter((r) => r.picked);
+    logOnly(`[汇总] 接口 ${apiHits} 次 · 改写 ${rewriteCount} 个字段`
+      + ` · 评论图 刷到 ${images.size} / 点开 ${openedImgs.length}`
+      + ` · 作品 刷到 ${works.size} / 标记 ${pickedWorks.length}`);
+
+    if (openedImgs.length) {
       say('');
-      say(`评论图  采到 ${all.length} 张，其中你点开过 ${opened.length} 张`);
-      if (opened.length) {
-        opened.slice(0, 20).forEach((r, i) => {
-          say(`  ${i + 1}. ${r.author}${r.text ? ' · ' + r.text : ''}`);
-        });
-        if (opened.length > 20) say(`  …还有 ${opened.length - 20} 张`);
-      }
+      say(`评论图  你点开过 ${openedImgs.length} 张：`);
+      openedImgs.slice(0, 20).forEach((r, i) => {
+        say(`  ${i + 1}. ${r.author}${r.text ? ' · ' + r.text : ''}`);
+      });
+      if (openedImgs.length > 20) say(`  …还有 ${openedImgs.length - 20} 张`);
+    }
+    if (pickedWorks.length) {
       say('');
-      const answer = (await askRaw('下载哪些？  y=只下载点开的   a=全部   回车=不下载： ')).trim().toLowerCase();
-      const target = /^a/.test(answer) ? all : (/^y/.test(answer) ? opened : null);
-      if (target && target.length) {
+      say(`作品  你点赞/收藏过 ${pickedWorks.length} 个：`);
+      pickedWorks.slice(0, 20).forEach((r, i) => {
+        const kind = r.imageUrls.length ? `图文 ${r.imageUrls.length} 张` : '视频';
+        say(`  ${i + 1}. ${r.author}${r.desc ? ' · ' + r.desc : ''}   (${kind})`);
+      });
+      if (pickedWorks.length > 20) say(`  …还有 ${pickedWorks.length - 20} 个`);
+    }
+
+    if (openedImgs.length + pickedWorks.length > 0) {
+      say('');
+      const answer = (await askRaw('下载上面这些？  y=下载   回车=不下载： ')).trim().toLowerCase();
+      if (/^y/.test(answer)) {
         try {
-          await downloadAll(target);
+          if (openedImgs.length) await downloadAll(openedImgs);
+          if (pickedWorks.length) await downloadWorks(pickedWorks);
+          if (OUT_DIR) {
+            say('');
+            say(`已保存到 ${OUT_DIR}`);
+            try {
+              spawn('explorer.exe', [OUT_DIR], { detached: true, stdio: 'ignore' }).unref();
+            } catch { /* 打不开就算了 */ }
+          }
         } catch (e) {
-          // 下载失败不能把整个收尾流程也带崩
-          say('下载过程出错：' + (e?.message || e));
-          say('原图直链如下，可复制出来用别的方式下载：');
-          for (const r of target) say('  ' + r.url);
+          say('下载出错：' + (e?.message || e));
         }
-      } else if (/^y/.test(answer)) {
-        say('这次没有点开过任何评论图片，没有可下载的。');
       }
-    } else if (FEATURES.aweme && worksSeen) {
+    } else if (FEATURES.comment || FEATURES.pick) {
       say('');
-      say(`作品  识别到 ${worksSeen} 个（在客户端里点"下载"存下来的就是无水印版）`);
-    } else if (!FEATURES.comment && !FEATURES.aweme) {
+      say('这轮没有标记任何东西，没有可下载的。');
+    } else {
       say('');
-      say('两个功能都没启用，本次没有做任何改写。');
+      say('（当前没启用"点开 / 标记"这类功能，所以没有需要下载的东西。）');
     }
     say('');
     say('已退出。');
