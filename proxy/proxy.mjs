@@ -19,6 +19,8 @@
  *   node proxy.mjs --restore-proxy  还原系统代理设置
  *   node proxy.mjs --port 8080      指定端口（默认 8080）
  *   node proxy.mjs -o D:\图片        指定原图保存目录（默认 图片\抖音原图）
+ *   node proxy.mjs --features comment,aweme   只启用指定功能（comment / aweme / all / none）
+ *   node proxy.mjs --choose-only    重新选功能并保存，不启动代理
  *   node proxy.mjs --yes            装证书时不再询问
  *   node proxy.mjs --trace          追踪模式：把客户端对图片 CDN 的每次请求都记进日志
  *   node proxy.mjs --dev            本地自测用：不碰系统代理、不检查证书信任
@@ -109,6 +111,72 @@ const PORT = Number(opt('--port', process.env.DY_PROXY_PORT || 8080));
 const AUTO_YES = has('--yes');
 const DEV = has('--dev');          // 本地自测用：不碰系统代理、不检查证书信任
 const TRACE = has('--trace');      // 追踪模式：把客户端对图片 CDN 的每一次请求都记进日志
+
+/* ============================ 功能开关 ============================ */
+/*
+ * 两个功能可以单独启用，互不依赖：
+ *   comment —— 评论区图片去水印（顺带"只保存你点开的"）
+ *   aweme   —— 作品去水印（视频 / 图文的保存与下载）
+ * 选择来源优先级：命令行 --features > features.json > 首次运行交互选择 > 默认全开
+ */
+
+const FEATURE_DEFS = [
+  {
+    key: 'comment',
+    name: '评论区图片去水印',
+    desc: '点开评论图片看到的就是原图，可以只保存你点开过的那几张',
+  },
+  {
+    key: 'aweme',
+    name: '作品去水印',
+    desc: '保存视频 / 图文作品时，拿到的是无水印版本',
+  },
+];
+const FEATURE_KEYS = FEATURE_DEFS.map((f) => f.key);
+const CONFIG_FILE = path.join(HERE, 'features.json');
+
+let FEATURES = Object.fromEntries(FEATURE_KEYS.map((k) => [k, true]));
+
+function loadFeatureConfig() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    const list = Array.isArray(raw.features) ? raw.features : [];
+    if (!list.length) return null;
+    const picked = Object.fromEntries(FEATURE_KEYS.map((k) => [k, list.includes(k)]));
+    if (!FEATURE_KEYS.some((k) => picked[k])) return null;
+    return picked;
+  } catch {
+    return null;
+  }
+}
+
+function saveFeatureConfig(features) {
+  try {
+    fs.writeFileSync(
+      CONFIG_FILE,
+      JSON.stringify({
+        features: FEATURE_KEYS.filter((k) => features[k]),
+        note: '改完保存即可生效；也可以用 选择功能.bat 重新选。留空数组或删掉本文件会回到默认（两个都开）。',
+      }, null, 2),
+      'utf8',
+    );
+  } catch { /* 写不进去不影响本次运行 */ }
+}
+
+function parseFeatureArg(value) {
+  const t = String(value || '').trim().toLowerCase();
+  const allTrue = () => Object.fromEntries(FEATURE_KEYS.map((k) => [k, true]));
+  const allFalse = () => Object.fromEntries(FEATURE_KEYS.map((k) => [k, false]));
+  if (!t || t === 'all') return allTrue();
+  if (t === 'none') return allFalse();
+  const parts = t.split(/[,，\s]+/).filter(Boolean);
+  const picked = Object.fromEntries(FEATURE_KEYS.map((k) => [k, parts.includes(k)]));
+  return FEATURE_KEYS.some((k) => picked[k]) ? picked : null;
+}
+
+function featuresToText(features) {
+  return FEATURE_DEFS.filter((f) => features[f.key]).map((f) => f.name).join(' + ') || '（全关）';
+}
 
 // 保存目录在启动时按"可写"逐个探测决定，所以这里是 let
 let OUT_DIR = '';
@@ -245,6 +313,30 @@ async function askRaw(question) {
   const answer = await new Promise((resolve) => rl.question(question, resolve));
   rl.close();
   return answer;
+}
+
+/** 首次运行时让用户选要启用哪些功能，结果会存进 features.json */
+async function chooseFeatures() {
+  say('请选择要启用的功能（可多选，用逗号分隔，例如 1,2）：');
+  say('');
+  FEATURE_DEFS.forEach((f, i) => say(`  ${i + 1}. ${f.name}　—— ${f.desc}`));
+  say('');
+  const all = Object.fromEntries(FEATURE_KEYS.map((k) => [k, true]));
+  const answer = (await askRaw('输入编号，直接回车＝两个都启用： ')).trim();
+  if (!answer) return all;
+
+  const picked = answer
+    .split(/[,，\s、]+/)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n >= 1 && n <= FEATURE_DEFS.length);
+
+  if (!picked.length) {
+    say('没看懂输入，这次先按"两个都启用"处理；下次可以双击 选择功能.bat 重选。');
+    return all;
+  }
+  const result = Object.fromEntries(FEATURE_DEFS.map((f, i) => [f.key, picked.includes(i + 1)]));
+  say(`已选择：${featuresToText(result)}（已记住，想改就双击 选择功能.bat）`);
+  return result;
 }
 
 /* ============================ 证书管理 ============================ */
@@ -390,6 +482,163 @@ function deWatermark(url) {
  */
 const OVERRIDE_FIELDS = ['owner_watermark_image', 'download_url'];
 
+/** 按 url 造一个和原节点同构的副本（保留 uri / 尺寸等字段，避免客户端对不上） */
+function cloneNodeLike(node, url) {
+  const copy = node && typeof node === 'object' ? JSON.parse(JSON.stringify(node)) : {};
+  copy.url_list = [url];
+  return copy;
+}
+
+/** 一张图片对象里"干净的那份"在哪：评论图看 origin_url，图文看顶层 url_list */
+function pickCleanImageUrl(im) {
+  if (!im || typeof im !== 'object') return '';
+  const raw = pickUrl(im.origin_url)
+    || pickUrl(im.url_list ? { url_list: im.url_list } : null)
+    || pickUrl(im.download_url)
+    || pickUrl(im.medium_url)
+    || '';
+  return raw ? deWatermark(raw) : '';
+}
+
+/** 把一张图片对象里"带水印的字段"指向干净的那份；返回改写了几个字段 */
+function rewriteOneImage(im) {
+  if (!im || typeof im !== 'object') return 0;
+  const clean = pickCleanImageUrl(im);
+  if (!clean) return 0;
+  // 用"干净那份"的元信息构造替换节点。
+  // 关键是 uri 也要跟着换 —— 否则 uri 指向带水印的对象、url_list 指向干净对象，
+  // 两边对不上，客户端若拿 uri 做缓存键就会出问题。
+  const src = (im.origin_url && typeof im.origin_url === 'object') ? im.origin_url : im;
+  let n = 0;
+  for (const field of OVERRIDE_FIELDS) {
+    if (!im[field]) continue;
+    const replacement = { url_list: [clean] };
+    for (const key of ['uri', 'width', 'height', 'data_size', 'file_hash']) {
+      if (src[key] != null) replacement[key] = src[key];
+    }
+    im[field] = replacement;
+    n++;
+  }
+  return n;
+}
+
+/** 递归把对象里所有 url_list 都换成同一个地址（用于 misc_download_addrs 这种嵌套结构） */
+function rewriteUrlLists(node, url, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 6) return 0;
+  let n = 0;
+  if (Array.isArray(node.url_list) && node.url_list.length) {
+    node.url_list = [url];
+    n++;
+  }
+  for (const key of Object.keys(node)) {
+    const val = node[key];
+    if (val && typeof val === 'object') n += rewriteUrlLists(val, url, depth + 1);
+  }
+  return n;
+}
+
+/**
+ * 作品去水印：视频和图文的下载字段都指向"播放用的那份"。
+ *
+ * 依据是客户端自己的 download() 实现（从 pc-web 包里挖出来的）：
+ *   优先 misc_download_addrs.suffix_scene → 其次 download_suffix_logo_addr → 兜底 download_addr
+ * 这三个都是"下载专用"地址（带水印/带 logo）。而 play_addr 是边播边下用的流，是干净的。
+ */
+/**
+ * 从视频对象里挑出"最干净的可用源"。
+ * 优先 bit_rate 里码率最高的那一档（都是干净播放源，而且画质最好），
+ * 没有 bit_rate 就退回 play_addr 系列。
+ */
+function pickCleanVideoSource(video) {
+  let bestNode = null;
+  let bestUrl = '';
+  let bestScore = -1;
+  for (const br of (Array.isArray(video.bit_rate) ? video.bit_rate : [])) {
+    const url = pickUrl(br && br.play_addr);
+    if (!url) continue;
+    const score = Number(br.bit_rate)
+      || (Number(br.play_addr && br.play_addr.width) * Number(br.play_addr && br.play_addr.height))
+      || 0;
+    if (score > bestScore) {
+      bestScore = score;
+      bestUrl = deWatermark(url);
+      bestNode = br.play_addr;
+    }
+  }
+  if (bestUrl) return { node: bestNode, url: bestUrl };
+
+  for (const field of ['play_addr', 'play_addr_lowbr', 'play_addr_265']) {
+    const url = pickUrl(video[field]);
+    if (url) return { node: video[field], url: deWatermark(url) };
+  }
+  return null;
+}
+
+function rewriteAweme(json) {
+  let fields = 0;
+  let works = 0;
+  const seen = new Set();
+  const stack = [json];
+
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object' || seen.has(node)) continue;
+    seen.add(node);
+
+    // ---- 视频 ----
+    const video = node.video;
+    if (video && typeof video === 'object') {
+      const clean = pickCleanVideoSource(video);
+      if (clean) {
+        let n = 0;
+        for (const field of ['download_addr', 'download_suffix_logo_addr', 'download_addr_265']) {
+          if (video[field]) {
+            video[field] = cloneNodeLike(clean.node, clean.url);
+            n++;
+          }
+        }
+        if (video.has_download_suffix_logo_addr) {
+          video.has_download_suffix_logo_addr = false;
+          n++;
+        }
+        if (typeof video.misc_download_addrs === 'string' && video.misc_download_addrs) {
+          try {
+            const misc = JSON.parse(video.misc_download_addrs);
+            const c = rewriteUrlLists(misc, clean.url);
+            if (c) {
+              video.misc_download_addrs = JSON.stringify(misc);
+              n += c;
+            }
+          } catch { /* 不是 JSON 就不动 */ }
+        }
+        if (n) {
+          fields += n;
+          works++;
+        }
+      }
+    }
+
+    // ---- 图文图片列表（评论图片走各自的分支）----
+    for (const key of ['images', 'image_list']) {
+      const arr = node[key];
+      if (!Array.isArray(arr)) continue;
+      let n = 0;
+      for (const im of arr) n += rewriteOneImage(im);
+      if (n) {
+        fields += n;
+        works++;
+      }
+    }
+
+    for (const key of Object.keys(node)) {
+      const val = node[key];
+      if (val && typeof val === 'object') stack.push(val);
+    }
+  }
+
+  return { fields, works };
+}
+
 /** 把评论 JSON 里"带水印图"的字段替换成 origin_url 的深拷贝。 */
 function rewriteComments(json) {
   const comments = json?.comments;
@@ -428,13 +677,7 @@ function rewriteComments(json) {
       imgs++;
 
       // 关键一步：带水印的字段整体换成原图节点（url_list / uri / 尺寸一起换，避免 uri 对不上）
-      for (const field of OVERRIDE_FIELDS) {
-        if (im[field]) {
-          im[field] = originNode ? JSON.parse(JSON.stringify(originNode)) : { url_list: [clean] };
-          if (im[field].url_list) im[field].url_list = [clean];
-          fields++;
-        }
-      }
+      fields += rewriteOneImage(im);
     }
   }
   rewriteCount += fields;
@@ -546,6 +789,16 @@ function shouldMitm(host) {
   return MITM_SUFFIXES.some((suffix) => h === suffix || h.endsWith('.' + suffix));
 }
 
+/**
+ * 判断一个请求路径要不要解析改写，返回 'comment' / 'aweme' / ''。
+ * 只按启用的功能决定，关掉的功能完全不做处理。
+ */
+function classifyEndpoint(pathname) {
+  if (FEATURES.comment && COMMENT_API_RE.test(pathname)) return 'comment';
+  if (FEATURES.aweme && /^\/aweme\//.test(pathname) && !COMMENT_API_RE.test(pathname)) return 'aweme';
+  return '';
+}
+
 function upstreamFor(hostname, port) {
   // 仅供本地自动化测试使用：DY_UPSTREAM_OVERRIDE="www.douyin.com=127.0.0.1:9443"
   const raw = process.env.DY_UPSTREAM_OVERRIDE || '';
@@ -590,11 +843,12 @@ function handleInnerRequest(req, res) {
     rejectUnauthorized: !up.insecure,
   };
 
-  const isApi = COMMENT_API_RE.test(target.pathname);
+  // '' = 不用管，原样放行；'comment' / 'aweme' = 需要解析并改写
+  const kind = classifyEndpoint(target.pathname);
   const started = Date.now();
 
   const upstreamReq = https.request(options, (upstreamRes) => {
-    if (!isApi) {
+    if (!kind) {
       if (TRACE) {
         traceSeq++;
         const tail = target.pathname.split('/').pop() || '';
@@ -646,23 +900,31 @@ function handleInnerRequest(req, res) {
       apiHits++;
       const raw = Buffer.concat(chunks);
       const decoded = decompress(raw, upstreamRes.headers['content-encoding']);
-      const outHeaders = { ...upstreamRes.headers };
-      for (const k of ['content-encoding', 'content-length', 'transfer-encoding', 'etag', 'content-md5']) {
-        delete outHeaders[k];
-      }
-      // 评论响应不要进客户端缓存：否则重新加载评论区时，客户端直接拿旧数据，
-      // 那些评论里的图片既不会被采集，也识别不出"点开"。
-      delete outHeaders.expires;
-      outHeaders['cache-control'] = 'no-store';
-
       let body = raw;
-      let stats = null;
+      let changed = 0;
+      let imgCount = 0;
+      let workCount = 0;
+
       if (decoded) {
+        let json = null;
         try {
-          const json = JSON.parse(decoded.toString('utf8'));
-          stats = rewriteComments(json);
-          body = Buffer.from(JSON.stringify(json), 'utf8');
-          if (TRACE) {
+          json = JSON.parse(decoded.toString('utf8'));
+        } catch { json = null; }
+
+        if (json) {
+          if (FEATURES.comment && kind === 'comment') {
+            const stats = rewriteComments(json);
+            changed += stats.fields;
+            imgCount = stats.imgs;
+          }
+          if (FEATURES.aweme) {
+            const stats = rewriteAweme(json);
+            changed += stats.fields;
+            workCount = stats.works;
+          }
+          if (changed > 0) body = Buffer.from(JSON.stringify(json), 'utf8');
+
+          if (TRACE && json.comments) {
             const tplOf = (node) => {
               const s = pickUrl(node);
               if (!s) return '-';
@@ -681,17 +943,28 @@ function handleInnerRequest(req, res) {
             }
             if (parts.length) logOnly('[api-images] ' + parts.join('  |  '));
           }
-        } catch {
-          body = decoded;
         }
       }
 
-      outHeaders['content-length'] = String(body.length);
+      const outHeaders = { ...upstreamRes.headers };
+      if (changed > 0) {
+        // 改写过的响应不要进客户端缓存：否则下次客户端直接拿旧的（未改写）数据，
+        // 评论那边还会导致我们看不到请求、识别不出"点开"。
+        for (const k of ['content-encoding', 'content-length', 'transfer-encoding', 'etag', 'content-md5', 'expires']) {
+          delete outHeaders[k];
+        }
+        outHeaders['cache-control'] = 'no-store';
+        outHeaders['content-length'] = String(body.length);
+      }
       res.writeHead(upstreamRes.statusCode, outHeaders);
       res.end(body);
 
-      const tag = stats ? `改写 ${stats.fields} 个字段 / ${stats.imgs} 张图` : '解析失败，原样放行';
-      say(`  [接口] ${target.pathname.split('/').slice(-3, -1).join('/')}  ${tag}  累计原图 ${images.size} 张 (${Date.now() - started}ms)`);
+      const tag = changed
+        ? `改写 ${changed} 个字段`
+          + (imgCount ? ` / ${imgCount} 张评论图` : '')
+          + (workCount ? ` / ${workCount} 个作品` : '')
+        : '无需改写';
+      say(`  [接口] ${kind}  ${tag}  累计原图 ${images.size} 张 (${Date.now() - started}ms)`);
     });
   });
 
@@ -794,8 +1067,50 @@ async function bindProxy(certs, preferredPort, autoPick) {
 async function main() {
   if (WATCHDOG_PID) return runWatchdog(WATCHDOG_PID);
 
-  say('抖音电脑版 · 评论区原图代理');
+  // 只做功能选择，不启动代理（给 选择功能.bat 用）
+  if (has('--choose-only')) {
+    say('抖音评论区 · 图片/作品去水印代理 —— 功能选择');
+    say('');
+    const picked = await chooseFeatures();
+    saveFeatureConfig(picked);
+    say('');
+    say(`已保存：${featuresToText(picked)}`);
+    say(`配置文件：${CONFIG_FILE}`);
+    say('下次双击 启动.bat 就按这个设置运行。');
+    return 0;
+  }
+
+  /* ---------- 决定启用哪些功能 ---------- */
+  // 优先级：命令行 --features > features.json > 首次运行交互选择 > 默认全开
+  const argFeatures = opt('--features', '');
+  if (argFeatures) {
+    const parsed = parseFeatureArg(argFeatures);
+    if (parsed) {
+      FEATURES = parsed;
+    } else {
+      say(`[功能] 认不出 --features=${argFeatures}，本次按"两个都启用"处理。`);
+    }
+  } else if (has('--choose')) {
+    FEATURES = await chooseFeatures();
+    saveFeatureConfig(FEATURES);
+  } else {
+    const saved = loadFeatureConfig();
+    if (saved) {
+      FEATURES = saved;
+    } else if (process.stdin.isTTY && !DEV) {
+      FEATURES = await chooseFeatures();
+      saveFeatureConfig(FEATURES);
+      say('');
+    }
+  }
+
+  say('抖音评论区 · 图片/作品去水印代理');
   say(`运行日志：${LOG_FILE || '(未能创建日志文件)'}`);
+  say(`[功能] 已启用：${featuresToText(FEATURES)}`);
+  if (!FEATURE_KEYS.some((k) => FEATURES[k])) {
+    say('[功能] 警告：一个功能都没启用，代理只会转发流量、不做任何改写。');
+    say('[功能] 想重选：双击 选择功能.bat，或者启动时加 --features comment,aweme');
+  }
   say('');
   say('[环境] 注册表图片文件夹=' + (knownPicturesDir() || '(读不到)'));
   say('[环境] node=' + process.version);
@@ -898,9 +1213,15 @@ async function main() {
   }
   say('');
   say('代理已启动。接下来：');
-  say('  1. 回到抖音电脑版，切到目标视频，让评论区重新加载一次（划走再点回来即可）；');
-  say('  2. 这时候点开评论图片看到的就是原图，点保存存下来的也是原图；');
-  say('  3. 用完回到这个窗口，直接按【回车】结束（或输入 q 再回车）。');
+  let step = 1;
+  say(`  ${step++}. 回到抖音电脑版，切到目标视频，让它重新加载一次（划走再点回来即可）；`);
+  if (FEATURES.comment) {
+    say(`  ${step++}. 点开评论图片看到的就是原图；点保存存下来的也是原图；`);
+  }
+  if (FEATURES.aweme) {
+    say(`  ${step++}. 视频/图文点"下载"存下来的就是无水印版本；`);
+  }
+  say(`  ${step++}. 用完回到这个窗口，直接按【回车】结束（或输入 q 再回车）。`);
   say('');
   say('注意：不要按 Ctrl+C。在 .bat 里按 Ctrl+C 会先弹出 cmd 自己的');
   say('"终止批处理操作吗(Y/N)?"，选 Y 会把整个窗口关掉，脚本就没机会还原代理了。');
@@ -911,8 +1232,10 @@ async function main() {
   // 定期报一次状态，顺便提醒怎么收尾。
   const heartbeat = setInterval(() => {
     const found = images.size;
-    if (found === 0) {
-      say(`[状态] 还没抓到原图。确认抖音里已经打开视频、并把评论区展开（划走再点回来）。`);
+    if (!FEATURES.comment) {
+      say(`[状态] 运行中，已改写 ${rewriteCount} 个字段（看到 ${apiHits} 次接口响应）。结束后按回车。`);
+    } else if (found === 0) {
+      say('[状态] 还没抓到评论原图。确认抖音里已经打开视频、并把评论区展开（划走再点回来）。');
     } else {
       say(`[状态] 已采集 ${found} 张原图（看到 ${apiHits} 次评论接口响应）。结束后按回车。`);
     }
