@@ -39,6 +39,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { generateCerts, loadCerts } from './certgen.mjs';
 import { imageSizeOf } from './imgsize.mjs';
+import { qualityCandidates } from './quality.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CERT_DIR = path.join(HERE, 'certs');
@@ -493,6 +494,7 @@ let apiHits = 0;
 let traceSeq = 0;
 let worksSeen = 0;          // 识别到的作品数（视频/图文）
 let unlockedTotal = 0;      // 其中原本禁止下载、被自动解除的个数
+let upgradedCount = 0;      // 评论图里自动换成了更大候选的个数
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
@@ -794,6 +796,16 @@ function rewriteComments(json) {
       const clean = deWatermark(origin);
 
       const uri = originNode?.uri || clean.split('?')[0];
+      // 把这条图片对象里所有候选地址都记进日志：排查"为什么抓到的比手机小"时全靠它
+      if (TRACE) {
+        const parts = [];
+        for (const f of ['origin_url', 'medium_url', 'thumbnail_url', 'download_url', 'owner_watermark_image']) {
+          const list = (im[f] && im[f].url_list) || [];
+          if (!list.length) continue;
+          parts.push(`${f}=${list.length}个:${list.map((u) => String(u).split('/').pop().slice(0, 46)).join(' | ')}`);
+        }
+        if (parts.length) logOnly(`[候选] ${uri.split('/').pop().slice(0, 18)}  ${parts.join('   ')}`);
+      }
       if (!images.has(uri)) {
         let originPath = '';
         try {
@@ -847,6 +859,56 @@ function extOf(url) {
   return /^(jpe?g|png|webp|gif|bmp|avif|heic)$/.test(e) ? (e === 'jpeg' ? 'jpg' : e) : 'jpg';
 }
 
+/** 抓一个地址的完整字节；超过上限就当这个候选不可用 */
+async function fetchBuf(url, capBytes = 30 * 1024 * 1024) {
+  const res = await fetch(url, {
+    headers: { Referer: 'https://www.douyin.com/', 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > capBytes) throw new Error(`超过 ${Math.round(capBytes / 1048576)}MB`);
+  return buf;
+}
+
+/** 只问大小、不下载正文：拿到 Content-Length 就返回，否则 null */
+async function headSize(url) {
+  try {
+    const res = await fetch(url, {
+      method: 'HEAD',
+      headers: { Referer: 'https://www.douyin.com/', 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const len = Number(res.headers.get('content-length'));
+    return Number.isFinite(len) && len > 0 ? len : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 挑最大的那份候选。
+ * 先用 HEAD 比大小（只问不拉，省流量），只把最大的那个真正下下来。
+ * 万一某个 CDN 不支持 HEAD，就退回原地址，绝不会比原来更差。
+ */
+async function fetchBestImage(rec) {
+  const candidates = qualityCandidates(rec.url);
+  const tried = [];
+  let winner = rec.url;
+  let winnerSize = 0;
+  for (const u of candidates) {
+    const len = await headSize(u);
+    tried.push({ url: u, size: len });
+    if (len && len > winnerSize) {
+      winnerSize = len;
+      winner = u;
+    }
+  }
+  const buf = await fetchBuf(winner);
+  return { url: winner, buf, tried, upgraded: winner !== rec.url };
+}
+
 async function downloadAll(records) {
   if (!records.length) {
     say('没有采集到图片，跳过下载。');
@@ -872,16 +934,19 @@ async function downloadAll(records) {
     const rec = records[i];
     const name = `${String(i + 1).padStart(String(records.length).length, '0')}_${sanitize(rec.author)}.${extOf(rec.url)}`;
     try {
-      const res = await fetch(rec.url, {
-        headers: { Referer: 'https://www.douyin.com/', 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(30000),
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const buf = Buffer.from(await res.arrayBuffer());
+      // 探测几个候选，取最大的那份
+      // （接口给的 origin_url 是"原始尺寸 + WebP 75%"，往往不是能拿到的最清晰版本）
+      const got = await fetchBestImage(rec);
+      const buf = got.buf;
       if (buf.length < 1024) throw new Error('内容过小');
       fs.writeFileSync(path.join(OUT_DIR, name), buf);
       ok++;
-      // 顺手核对：拿到的到底是不是原始分辨率
+      if (got.upgraded) upgradedCount++;
+      if (got.tried.length > 1) {
+        logOnly(`[画质] ${name}  候选 `
+          + got.tried.map((t) => (t.size ? `${Math.round(t.size / 1024)}KB` : '取不到')).join(' / ')
+          + `  选中 ${got.url.slice(-70)}`);
+      }
       // 尺寸只在"和接口声明对不上"时才提示，正常情况不刷屏
       const dim = imageSizeOf(buf);
       let note = '';
@@ -896,6 +961,9 @@ async function downloadAll(records) {
     }
   }
   say(`完成：${ok}/${records.length} 张`);
+  if (upgradedCount) {
+    say(`（其中 ${upgradedCount} 张原始地址不是最清晰的，已自动换成更大的那份）`);
+  }
   return ok;
 }
 
