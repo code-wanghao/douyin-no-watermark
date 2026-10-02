@@ -504,10 +504,11 @@ let worksSeen = 0;          // 识别到的作品数（视频/图文）
 let unlockedTotal = 0;      // 其中原本禁止下载、被自动解除的个数
 let upgradedCount = 0;      // 评论图里自动换成了更大候选的个数
 let imgFormatHits = 0;      // 实验：改写 pc_img_format 的次数
+let blockedSeen = 0;        // 看到多少个"原本禁止下载"的作品
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.4.3';
+const VERSION = 'v1.4.4';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -652,6 +653,25 @@ function rewriteAweme(json) {
     const awemeId = node.aweme_id || node.awemeId || '';
     if (awemeId && (node.video || Array.isArray(node.images))) {
       collectWork(node, awemeId);
+
+      // 诊断：这个作品是不是被作者限制了下载？
+      // 不管有没有开"作品去水印"都记一笔 —— 否则用户看到灰按钮也不知道是没开功能还是没生效
+      const vc = node.video_control;
+      const restricted = node.prevent_download === true
+        || (vc && typeof vc === 'object'
+          && (vc.allow_download === false
+            || (vc.download_info && typeof vc.download_info === 'object' && vc.download_info.level !== 0)));
+      if (restricted) {
+        blockedSeen++;
+        logOnly(`[限制] aweme_id=${awemeId} 原本禁止下载`
+          + `（allow_download=${vc && vc.allow_download}`
+          + ` level=${vc && vc.download_info && vc.download_info.level}`
+          + ` prevent_download=${node.prevent_download}）`
+          + (FEATURES.aweme ? ' → 已解除' : ' → 但"作品去水印"没启用，没有解除'));
+        if (!FEATURES.aweme) {
+          logOnly('[限制] 想解除请在 选择功能.bat 里勾选「作品去水印」');
+        }
+      }
     }
 
     // ---- 视频 ----
@@ -1716,6 +1736,11 @@ async function main() {
     }
     if (unlockedTotal) {
       logOnly(`[解锁] 本次共自动解除 ${unlockedTotal} 处"禁止下载"限制`);
+    }
+    if (blockedSeen && !FEATURES.aweme) {
+      say('');
+      say(`注意：这轮看到 ${blockedSeen} 个作品是"作者禁止下载"的，但「作品去水印」没启用，所以没解除。`);
+      say('      想解除就双击 选择功能.bat，把「作品去水印」也勾上。');
     }
 
     if (openedImgs.length + pickedWorks.length > 0) {
