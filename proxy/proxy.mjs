@@ -510,7 +510,7 @@ let blockedSeen = 0;        // 看到多少个"原本禁止下载"的作品
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.6.0';
+const VERSION = 'v1.6.1';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -624,11 +624,11 @@ function pickCleanVideoSource(video) {
       bestNode = br.play_addr;
     }
   }
-  if (bestUrl) return { node: bestNode, url: bestUrl };
+  if (bestUrl) return { node: bestNode, url: bestUrl, uri: (bestNode && bestNode.uri) || '' };
 
   for (const field of ['play_addr', 'play_addr_lowbr', 'play_addr_265']) {
     const url = pickUrl(video[field]);
-    if (url) return { node: video[field], url: deWatermark(url) };
+    if (url) return { node: video[field], url: deWatermark(url), uri: video[field].uri || '' };
   }
   return null;
 }
@@ -767,6 +767,8 @@ function collectWork(node, awemeId) {
       desc: '',
       author: '',
       videoUrl: '',
+      playUri: '',
+      tierUris: [],
       imageUrls: [],
       picked: false,
       pickKind: '',
@@ -775,9 +777,19 @@ function collectWork(node, awemeId) {
   }
 
   const video = node.video;
-  if (video && typeof video === 'object' && !rec.videoUrl) {
+  if (video && typeof video === 'object') {
     const clean = pickCleanVideoSource(video);
-    if (clean) rec.videoUrl = clean.url;
+    if (clean) {
+      if (!rec.videoUrl) rec.videoUrl = clean.url;
+      // uri 是视频的永久编号，不会过期；结束时靠它去换新鲜的下载地址
+      if (!rec.playUri) rec.playUri = clean.uri || '';
+    }
+    if (!rec.tierUris.length && Array.isArray(video.bit_rate)) {
+      for (const br of video.bit_rate) {
+        const u = br && br.play_addr && br.play_addr.uri;
+        if (u) rec.tierUris.push(u);
+      }
+    }
   }
   if (Array.isArray(node.images) && !rec.imageUrls.length) {
     for (const im of node.images) {
@@ -1107,6 +1119,24 @@ async function downloadToFile(url, file, onProgress) {
  * 下载作品（视频 / 图文）。这一步才是真正走流量的时候，而且只下你标记过的那些。
  * 视频动辄几十 MB，所以每张 25% 报一次进度，避免长时间没反馈。
  */
+/**
+ * 用一个作品的永久编号（uri）去换新鲜的下载地址。
+ * 实时收集到的是"下载地址"，那个地址带签名、会过期；uri 不会过期。
+ * 实测：/aweme/v1/play/?video_id=<uri>&ratio=1080p 会 302 到一个可下载的地址，且不需要签名。
+ */
+function playApiCandidates(rec) {
+  const uris = [rec.playUri, ...(rec.tierUris || [])].filter(Boolean);
+  const out = [];
+  for (const uri of [...new Set(uris)]) {
+    for (const ratio of ['1080p', '720p', '540p', '']) {
+      out.push('https://www.douyin.com/aweme/v1/play/?video_id=' + encodeURIComponent(uri)
+        + (ratio ? `&ratio=${ratio}&line=0` : ''));
+    }
+  }
+  if (rec.videoUrl) out.push(rec.videoUrl);
+  return out;
+}
+
 async function downloadWorks(records) {
   if (!OUT_DIR) {
     say('没有可写目录，改为把地址打印出来：');
@@ -1145,24 +1175,29 @@ async function downloadWorks(records) {
     }
 
     // ---- 视频 ----
-    if (rec.videoUrl) {
+    const candidates = playApiCandidates(rec);
+    if (candidates.length) {
       const name = `${who}_${what}.mp4`;
       const file = path.join(videoDir, name);
-      let lastStep = 0;
-      try {
-        const size = await downloadToFile(rec.videoUrl, file, (got, total) => {
-          if (!total) return;
-          const step = Math.floor((got / total) * 4);   // 每 25% 报一次
-          if (step > lastStep) {
-            lastStep = step;
-            say(`  ${tag}${name}  ${step * 25}%`);
-          }
-        });
-        say(`  ${tag}${name}  ${(size / 1048576).toFixed(1)} MB`);
-        ok++;
-      } catch (e) {
-        say(`  ${tag}${name}  失败（${e.message}）`);
-        logOnly(`[下载] 视频失败：${rec.videoUrl}`);
+      for (const [k, u] of candidates.entries()) {
+        let lastStep = 0;
+        try {
+          const size = await downloadToFile(u, file, (got, total) => {
+            if (!total) return;
+            const step = Math.floor((got / total) * 4);   // 每 25% 报一次
+            if (step > lastStep) {
+              lastStep = step;
+              say(`  ${tag}${name}  ${step * 25}%`);
+            }
+          });
+          const src = u.includes('/aweme/v1/play/') ? ((u.match(/ratio=(\w+)/) || [])[1] || '默认') : '缓存直链';
+          say(`  ${tag}${name}  ${(size / 1048576).toFixed(1)} MB  (${src})`);
+          ok++;
+          break;
+        } catch (e) {
+          logOnly(`[下载] 候选 ${k + 1} 失败：${u.slice(0, 90)} → ${e.message}`);
+          if (k === candidates.length - 1) say(`  ${tag}${name}  失败（${e.message}）`);
+        }
       }
       continue;
     }
@@ -1758,6 +1793,8 @@ async function main() {
             author: r.author || prev.author || '',
             desc: r.desc || prev.desc || '',
             videoUrl: r.videoUrl || prev.videoUrl || '',
+            playUri: r.playUri || prev.playUri || '',
+            tierUris: (r.tierUris && r.tierUris.length) ? r.tierUris : (prev.tierUris || []),
             imageUrls: (r.imageUrls && r.imageUrls.length) ? r.imageUrls : (prev.imageUrls || []),
             updatedAt: new Date().toISOString(),
           });

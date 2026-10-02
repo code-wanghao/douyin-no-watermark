@@ -44,6 +44,50 @@ async function fetchBuf(url) {
 }
 
 /**
+ * 流式下载并报进度。
+ * 之前是整份读进内存再落盘、中途一个字都不输出 —— 一个 100 多 MB 的视频看起来就像卡死了，
+ * 用户以为失败把窗口关了，结果什么都没存下。所以这里边下边报，并且直接写文件。
+ */
+async function fetchToFile(url, file, indent = '      ') {
+  const res = await fetch(url, {
+    headers: { referer: 'https://www.douyin.com/', 'user-agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(300000),
+  });
+  if (!res.ok && res.status !== 206) throw new Error('HTTP ' + res.status);
+
+  const total = Number(res.headers.get('content-length')) || 0;
+  say(`${indent}开始接收${total ? `，约 ${(total / 1048576).toFixed(1)} MB` : ''}…`);
+
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const out = fs.createWriteStream(file);
+  let got = 0;
+  let step = 0;
+  let lastMb = 0;
+  try {
+    for await (const chunk of res.body) {
+      got += chunk.length;
+      if (!out.write(chunk)) await new Promise((r) => out.once('drain', r));
+      if (total) {
+        const s = Math.floor((got / total) * 4);       // 每 25% 报一次
+        if (s > step) {
+          step = s;
+          say(`${indent}${s * 25}%  ${(got / 1048576).toFixed(0)} / ${(total / 1048576).toFixed(0)} MB`);
+        }
+      } else {
+        const mb = Math.floor(got / 1048576);
+        if (mb >= lastMb + 10) {                        // 拿不到总大小时，每 10MB 报一次
+          lastMb = mb;
+          say(`${indent}已接收 ${mb} MB`);
+        }
+      }
+    }
+  } finally {
+    await new Promise((r) => out.end(r));
+  }
+  return got;
+}
+
+/**
  * 缓存里的播放地址是带签名的，会过期（实测见过过期 12 天的）。
  * 但 play_addr.uri 是视频的永久编号 —— 用它请求播放跳转接口，能换到一个"新鲜的"地址。
  * 实测：HTTP 302 → 跟随后 206，直接拿到视频流。
@@ -86,16 +130,16 @@ async function downloadWork(rec, i, total) {
   const urls = playApiUrls(rec);
   for (const [k, u] of urls.entries()) {
     try {
-      const buf = await fetchBuf(u);
-      fs.mkdirSync(OUT_DIR, { recursive: true });
       const file = path.join(OUT_DIR, `${who}_${what}.mp4`);
-      fs.writeFileSync(file, buf);
-      const src = urls[k].startsWith('https://www.douyin.com/aweme/v1/play/')
+      const src = u.startsWith('https://www.douyin.com/aweme/v1/play/')
         ? (urls[k].match(/ratio=(\w+)/) || [])[1] || '默认'
         : '缓存直链';
-      say(`  ${tag}${who} · ${(buf.length / 1048576).toFixed(1)} MB  (${src})`);
+      say(`  ${tag}${who} · 正在取流（${src}）`);
+      const size = await fetchToFile(u, file);
+      say(`  ${tag}${who} · 完成 ${(size / 1048576).toFixed(1)} MB  (${src})`);
       return true;
     } catch (e) {
+      say(`  ${tag}${who} · 这一档不行（${e.message}），换下一档`);
       if (k === urls.length - 1) say(`  ${tag}${who} · 失败（${e.message}）`);
     }
   }
@@ -110,13 +154,15 @@ async function ask(question) {
 }
 
 async function main() {
-  let idx = REFRESH ? { builtAt: '', records: [] } : loadIndex();
-  if (!idx.records.length) {
+  // 默认每次重新扫一遍 —— 否则你刚刷过的视频不会出现在列表里，还得去记 --refresh。
+  // 想跳过扫描用旧的索引：加 --cached
+  let idx;
+  if (args.includes('--cached') && !REFRESH) {
+    idx = loadIndex();
+    if (!idx.records.length) idx = buildIndex();
+  } else {
     idx = buildIndex();
     say('');
-  } else {
-    say(`· 用的缓存索引（${idx.builtAt ? idx.builtAt.slice(0, 19).replace('T', ' ') : '未知时间'}，${idx.records.length} 个作品）`);
-    say('  想重新扫一遍：加 --refresh');
   }
 
   let list = idx.records.slice();
