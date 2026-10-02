@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { imageSizeOf } from './imgsize.mjs';
 import { qualityCandidates } from './quality.mjs';
@@ -27,11 +28,27 @@ const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 const args = process.argv.slice(2);
 const PROBE_ONLY = args.includes('--probe');
-const linkArg = args.find((a) => /^https?:\/\//i.test(a)) || '';
+// 抖音"复制链接"复制的是一整段分享文字（文案 + 短链 + 提示语），所以要在整串里找 URL，
+// 不能要求参数以 http 开头。
+const linkArg = args.find((a) => /https?:\/\//i.test(a)) || '';
 
 const say = (m) => process.stdout.write(m + '\n');
 const log = (m) => { if (args.includes('--debug')) say('  [debug] ' + m); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 从一整段分享文字里抠出第一个链接 */
+function pickUrl(text) {
+  const m = String(text).match(/https?:\/\/[^\s，,。！!、]+/);
+  return m ? m[0] : '';
+}
+
+/** 没有命令行参数时，自己从控制台读一行（避免把中文和特殊符号交给 cmd 传递） */
+async function readLinkFromConsole() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise((r) => rl.question('粘贴分享链接后回车: ', r));
+  rl.close();
+  return answer.trim();
+}
 
 /* ---------------- 拿页面 ---------------- */
 
@@ -75,23 +92,50 @@ function tryParseJson(s) {
   try { return JSON.parse(t); } catch { return null; }
 }
 
+/**
+ * 从 startIdx（必须是 { ）开始做括号配对，取出完整的对象字面量。
+ * 不能用正则的 \{[\s\S]*?\} —— 非贪婪会在第一个 } 就停，嵌套对象必然被截断。
+ */
+function extractBalanced(text, startIdx) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(startIdx, i + 1);
+    }
+  }
+  return '';
+}
+
 function extractJsonBlobs(html) {
   const blobs = [];
   const push = (v) => { if (v) blobs.push(v); };
 
-  // <script ...>...</script>
+  // window._ROUTER_DATA = {...};   ← 分享页的作品数据就在这里
+  for (const m of html.matchAll(/_ROUTER_DATA\s*=\s*/g)) {
+    const brace = html.indexOf('{', m.index + m[0].length);
+    if (brace < 0) continue;
+    push(tryParseJson(extractBalanced(html, brace)));
+  }
+
+  // <script> 里的纯 JSON，或 "var x = {...}" 这类赋值
   for (const m of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)) {
-    const raw = m[1];
+    const raw = m[1].trim();
     push(tryParseJson(raw));
+    const brace = raw.indexOf('{');
+    if (brace >= 0 && brace < 200) push(tryParseJson(extractBalanced(raw, brace)));
     try { push(tryParseJson(decodeURIComponent(raw))); } catch { /* 不是 URL 编码 */ }
-  }
-  // window._ROUTER_DATA = {...};
-  for (const m of html.matchAll(/_ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/gi)) {
-    push(tryParseJson(m[1]));
-  }
-  // __pace_f 之类的自执行负载
-  for (const m of html.matchAll(/"videoInfoRes"\s*:\s*(\{[\s\S]*?\})\s*,\s*"/gi)) {
-    push(tryParseJson(m[1]));
   }
   return blobs;
 }
@@ -181,19 +225,25 @@ async function downloadToFile(url, file) {
 /* ---------------- 主流程 ---------------- */
 
 async function main() {
-  if (!linkArg) {
-    say('用法: node linkdl.mjs "https://v.douyin.com/xxxxx/"');
-    say('  加 --probe 只探测不下载；加 --debug 看细节');
+  let raw = linkArg;
+  if (!raw) raw = await readLinkFromConsole();
+
+  const url = pickUrl(raw);
+  if (!url) {
+    say('');
+    say('× 这段文字里没找到链接。');
+    say('  请用抖音的"分享 → 复制链接"，粘贴过来的应该形如：');
+    say('  7.46 xxx... https://v.douyin.com/xxxxx/ 复制此链接...');
     return 1;
   }
 
-  say(`链接: ${linkArg}`);
-  let awemeId = pickAwemeId(linkArg);
+  say(`· 识别到链接: ${url}`);
+  let awemeId = pickAwemeId(url);
 
   // 1) 短链跟随跳转
   if (!awemeId) {
     say('· 正在解析短链…');
-    const head = await get(linkArg, IPHONE_UA);
+    const head = await get(url, IPHONE_UA);
     log(`跳到: ${head.url}`);
     awemeId = pickAwemeId(head.url) || pickAwemeId(head.text);
     if (awemeId) say(`· 解析出作品 id: ${awemeId}`);

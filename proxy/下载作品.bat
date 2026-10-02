@@ -3,12 +3,11 @@ chcp 65001 >nul
 setlocal
 
 echo.
-echo  In the app: share - copy link, then paste below (right-click) and press Enter.
+echo  This lists the works found in the Douyin client cache and lets you pick
+echo  which ones to download -- including works whose download button is greyed out.
 echo.
 
-rem The link is read by the tool itself (not passed through cmd) so that
-rem Chinese text and special characters in the share string cannot break parsing.
-call "%~dp0_node_raw.cmd" "%~dp0linkdl.mjs" %*
+call "%~dp0_node_raw.cmd" "%~dp0works.mjs" %*
 set "RC=%ERRORLEVEL%"
 
 echo.

@@ -510,7 +510,7 @@ let blockedSeen = 0;        // 看到多少个"原本禁止下载"的作品
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.5.0';
+const VERSION = 'v1.6.0';
 
 function pickUrl(node) {
   if (!node) return '';
