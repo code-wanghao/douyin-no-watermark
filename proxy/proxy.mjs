@@ -39,7 +39,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { generateCerts, loadCerts } from './certgen.mjs';
 import { imageSizeOf } from './imgsize.mjs';
-import { qualityCandidates } from './quality.mjs';
+import { qualityCandidates, collectImageCandidates } from './quality.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CERT_DIR = path.join(HERE, 'certs');
@@ -112,6 +112,14 @@ const PORT = Number(opt('--port', process.env.DY_PROXY_PORT || 8080));
 const AUTO_YES = has('--yes');
 const DEV = has('--dev');          // 本地自测用：不碰系统代理、不检查证书信任
 const TRACE = has('--trace');      // 追踪模式：把客户端对图片 CDN 的每一次请求都记进日志
+
+/*
+ * 实验开关：让评论接口换一种图片格式返回。
+ * 客户端请求评论接口时会带 pc_img_format=webp，接口因此给的都是"origin-webp:q75"这种 WebP 转码版；
+ * 如果把它改成 jpeg（或不带），理论上能拿到更高码率的 JPEG 原图。
+ * 风险：请求 URL 带 a_bogus 签名，改参数可能直接校验不通过 —— 所以做成实验开关，由用户决定试不试。
+ */
+const IMG_FORMAT = String(opt('--img-format', '')).trim().toLowerCase();
 
 /* ============================ 功能开关 ============================ */
 /*
@@ -498,7 +506,7 @@ let upgradedCount = 0;      // 评论图里自动换成了更大候选的个数
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.4.0';
+const VERSION = 'v1.4.1';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -814,6 +822,8 @@ function rewriteComments(json) {
         const rec = {
           uri,
           url: clean,
+          // 这条图片对象里所有可用地址（含其它字段的），下载时拿来比大小
+          candidates: collectImageCandidates(im, clean),
           originPath,
           opened: false,
           author: c?.user?.nickname || c?.user?.unique_id || '匿名',
@@ -871,20 +881,43 @@ async function fetchBuf(url, capBytes = 30 * 1024 * 1024) {
   return buf;
 }
 
-/** 只问大小、不下载正文：拿到 Content-Length 就返回，否则 null */
-async function headSize(url) {
+/**
+ * 只问大小、不下载正文。
+ * 先试 HEAD；有些 CDN 不给 HEAD，就退化成 Range: bytes=0-0，从 Content-Range 里读总大小。
+ */
+async function probeSize(url) {
   try {
     const res = await fetch(url, {
       method: 'HEAD',
       headers: { Referer: 'https://www.douyin.com/', 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) return null;
-    const len = Number(res.headers.get('content-length'));
-    return Number.isFinite(len) && len > 0 ? len : null;
-  } catch {
-    return null;
-  }
+    if (res.ok) {
+      const len = Number(res.headers.get('content-length'));
+      if (Number.isFinite(len) && len > 0) return len;
+    }
+  } catch { /* 落到 Range 那条路 */ }
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Referer: 'https://www.douyin.com/',
+        'User-Agent': 'Mozilla/5.0',
+        Range: 'bytes=0-0',
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.status === 206) {
+      const total = Number(String(res.headers.get('content-range') || '').split('/')[1]);
+      await res.arrayBuffer();
+      if (Number.isFinite(total) && total > 0) return total;
+    }
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      if (buf.length > 0) return buf.length;
+    }
+  } catch { /* 这个候选不可用 */ }
+  return null;
 }
 
 /**
@@ -893,12 +926,14 @@ async function headSize(url) {
  * 万一某个 CDN 不支持 HEAD，就退回原地址，绝不会比原来更差。
  */
 async function fetchBestImage(rec) {
-  const candidates = qualityCandidates(rec.url);
+  // 候选 = 这条图片对象里所有字段的地址（含其它字段）+ 每个地址的加工变体
+  const base = [...(rec.candidates || []), rec.url].filter(Boolean);
+  const candidates = [...new Set(base.flatMap((u) => qualityCandidates(u)))];
   const tried = [];
   let winner = rec.url;
   let winnerSize = 0;
   for (const u of candidates) {
-    const len = await headSize(u);
+    const len = await probeSize(u);
     tried.push({ url: u, size: len });
     if (len && len > winnerSize) {
       winnerSize = len;
@@ -943,7 +978,7 @@ async function downloadAll(records) {
       ok++;
       if (got.upgraded) upgradedCount++;
       if (got.tried.length > 1) {
-        logOnly(`[画质] ${name}  候选 `
+        logOnly(`[画质] ${name}  共 ${got.tried.length} 个候选  `
           + got.tried.map((t) => (t.size ? `${Math.round(t.size / 1024)}KB` : '取不到')).join(' / ')
           + `  选中 ${got.url.slice(-70)}`);
       }

@@ -37,3 +37,37 @@ export function qualityCandidates(url) {
   } catch { /* 地址不合法就只用原地址 */ }
   return [...new Set(out)];
 }
+
+/** 看这个地址是不是"带水印模板"的版本 */
+export function looksWatermarked(url) {
+  return /watermark/i.test(String(url));
+}
+
+/**
+ * 把一张图片对象里所有字段的地址汇总成候选，并做安全处理：
+ *   · 带水印模板的地址不能直接用 —— 但把它去掉模板后的原始对象地址加进来（那才是干净的原始文件）
+ * 顺序：干净的优先，其次才是各字段。
+ */
+export function collectImageCandidates(imageObject, cleanUrl) {
+  const out = [];
+  const push = (u) => {
+    if (typeof u === 'string' && u.startsWith('http') && !out.includes(u)) out.push(u);
+  };
+
+  const FIELDS = ['origin_url', 'download_url', 'medium_url', 'thumbnail_url', 'owner_watermark_image'];
+  for (const f of FIELDS) {
+    const list = (imageObject && imageObject[f] && imageObject[f].url_list) || [];
+    for (const u of list) {
+      if (looksWatermarked(u)) {
+        // 带水印的不直接用，但试着把模板去掉，取底层原始对象
+        for (const stripped of qualityCandidates(u)) {
+          if (!looksWatermarked(stripped)) push(stripped);
+        }
+      } else {
+        push(u);
+      }
+    }
+  }
+  if (cleanUrl) push(cleanUrl);
+  return out;
+}
