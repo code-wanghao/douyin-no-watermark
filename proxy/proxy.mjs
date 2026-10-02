@@ -503,10 +503,11 @@ let traceSeq = 0;
 let worksSeen = 0;          // 识别到的作品数（视频/图文）
 let unlockedTotal = 0;      // 其中原本禁止下载、被自动解除的个数
 let upgradedCount = 0;      // 评论图里自动换成了更大候选的个数
+let imgFormatHits = 0;      // 实验：改写 pc_img_format 的次数
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.4.1';
+const VERSION = 'v1.4.2';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -926,18 +927,18 @@ async function probeSize(url) {
  * 万一某个 CDN 不支持 HEAD，就退回原地址，绝不会比原来更差。
  */
 async function fetchBestImage(rec) {
-  // 候选 = 这条图片对象里所有字段的地址（含其它字段）+ 每个地址的加工变体
-  const base = [...(rec.candidates || []), rec.url].filter(Boolean);
-  const candidates = [...new Set(base.flatMap((u) => qualityCandidates(u)))];
+  // 候选在采集阶段就准备好了（含所有字段 + 各自变体，并标了来源）
+  const list = (rec.candidates || []).filter((c) => c && c.url);
+  if (!list.some((c) => c.url === rec.url)) list.unshift({ url: rec.url, from: 'clean' });
   const tried = [];
   let winner = rec.url;
   let winnerSize = 0;
-  for (const u of candidates) {
-    const len = await probeSize(u);
-    tried.push({ url: u, size: len });
+  for (const c of list) {
+    const len = await probeSize(c.url);
+    tried.push({ ...c, size: len });
     if (len && len > winnerSize) {
       winnerSize = len;
-      winner = u;
+      winner = c.url;
     }
   }
   const buf = await fetchBuf(winner);
@@ -978,9 +979,11 @@ async function downloadAll(records) {
       ok++;
       if (got.upgraded) upgradedCount++;
       if (got.tried.length > 1) {
-        logOnly(`[画质] ${name}  共 ${got.tried.length} 个候选  `
-          + got.tried.map((t) => (t.size ? `${Math.round(t.size / 1024)}KB` : '取不到')).join(' / ')
-          + `  选中 ${got.url.slice(-70)}`);
+        const usable = got.tried.filter((t) => t.size).sort((a, b) => b.size - a.size);
+        const wonFrom = (got.tried.find((t) => t.url === got.url) || {}).from || '?';
+        logOnly(`[画质] ${name}  选中 ${Math.round(got.buf.length / 1024)}KB（来源 ${wonFrom}）`
+          + `  可用 ${usable.length}/${got.tried.length}：`
+          + usable.map((t) => `${Math.round(t.size / 1024)}KB(${t.from})`).join('  '));
       }
       // 尺寸只在"和接口声明对不上"时才提示，正常情况不刷屏
       const dim = imageSizeOf(buf);
@@ -1174,12 +1177,36 @@ function handleInnerRequest(req, res) {
     } catch { /* 参数解析失败就算了 */ }
   }
 
+  /*
+   * 实验开关 --img-format：
+   * 客户端请求评论接口时带 pc_img_format=webp，接口因此只给 WebP 转码版。
+   * 改掉这个参数理论上能要来更高码率的原始图，但请求 URL 带 a_bogus 签名，
+   * 改参数有可能直接校验不通过 —— 所以做成实验，由用户决定试不试。
+   */
+  let requestPath = target.pathname + target.search;
+  if (IMG_FORMAT && COMMENT_API_RE.test(target.pathname)) {
+    try {
+      const probe = new URL(target.pathname + target.search, 'https://x.invalid');
+      if (probe.searchParams.has('pc_img_format')) {
+        const before = probe.searchParams.get('pc_img_format');
+        if (IMG_FORMAT === 'none') probe.searchParams.delete('pc_img_format');
+        else probe.searchParams.set('pc_img_format', IMG_FORMAT);
+        requestPath = probe.pathname + probe.search;
+        if (imgFormatHits === 0) {
+          logOnly(`[实验] pc_img_format：${before} → ${IMG_FORMAT}`);
+          say(`  · 实验：已把评论接口的图片格式请求改成 ${IMG_FORMAT}（接口若报错说明签名校验不通过）`);
+        }
+        imgFormatHits++;
+      }
+    } catch { /* 解析失败就不改 */ }
+  }
+
   const up = upstreamFor(target.hostname, Number(target.port) || 443);
   const options = {
     host: up.host,
     port: up.port,
     method: req.method,
-    path: target.pathname + target.search,
+    path: requestPath,
     headers,
     servername: target.hostname,
     rejectUnauthorized: !up.insecure,

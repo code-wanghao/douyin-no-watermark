@@ -50,24 +50,38 @@ export function looksWatermarked(url) {
  */
 export function collectImageCandidates(imageObject, cleanUrl) {
   const out = [];
-  const push = (u) => {
-    if (typeof u === 'string' && u.startsWith('http') && !out.includes(u)) out.push(u);
+  const seen = new Set();
+  const push = (u, from) => {
+    if (typeof u !== 'string' || !u.startsWith('http') || seen.has(u)) return;
+    seen.add(u);
+    out.push({ url: u, from });
   };
 
+  // 先收集"这条图片对象里到底有哪些地址"，并标明来源字段
+  const sources = [];
   const FIELDS = ['origin_url', 'download_url', 'medium_url', 'thumbnail_url', 'owner_watermark_image'];
   for (const f of FIELDS) {
     const list = (imageObject && imageObject[f] && imageObject[f].url_list) || [];
-    for (const u of list) {
-      if (looksWatermarked(u)) {
-        // 带水印的不直接用，但试着把模板去掉，取底层原始对象
-        for (const stripped of qualityCandidates(u)) {
-          if (!looksWatermarked(stripped)) push(stripped);
-        }
-      } else {
-        push(u);
+    for (const u of list) sources.push({ url: u, from: f });
+  }
+  // 图片对象自己的顶层 url_list（图文主要靠它，评论图偶尔也有）
+  for (const u of ((imageObject && imageObject.url_list) || [])) {
+    sources.push({ url: u, from: 'url_list' });
+  }
+
+  for (const { url, from } of sources) {
+    if (looksWatermarked(url)) {
+      // 带水印的地址不直接用；只取它去掉模板后的原始对象（那才是干净的原始文件）
+      for (const alt of qualityCandidates(url)) {
+        if (alt !== url && !looksWatermarked(alt)) push(alt, `去模板(${from})`);
+      }
+    } else {
+      push(url, from);
+      for (const alt of qualityCandidates(url)) {
+        if (alt !== url) push(alt, `变体(${from})`);
       }
     }
   }
-  if (cleanUrl) push(cleanUrl);
+  if (cleanUrl) push(cleanUrl, 'clean');
   return out;
 }
