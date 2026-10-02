@@ -167,7 +167,7 @@ function saveFeatureConfig(features) {
       CONFIG_FILE,
       JSON.stringify({
         features: FEATURE_KEYS.filter((k) => features[k]),
-        note: '改完保存即可生效；也可以用 选择功能.bat 重新选。留空数组或删掉本文件会回到默认（两个都开）。',
+        note: '改完保存即可生效；也可以用 选择功能.bat 重新选。留空数组或删掉本文件会回到默认（全部启用）。',
       }, null, 2),
       'utf8',
     );
@@ -498,7 +498,7 @@ let upgradedCount = 0;      // 评论图里自动换成了更大候选的个数
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.2.0';
+const VERSION = 'v1.4.0';
 
 function pickUrl(node) {
   if (!node) return '';
