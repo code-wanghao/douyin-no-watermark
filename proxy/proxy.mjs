@@ -507,7 +507,7 @@ let imgFormatHits = 0;      // 实验：改写 pc_img_format 的次数
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.4.2';
+const VERSION = 'v1.4.3';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -883,6 +883,33 @@ async function fetchBuf(url, capBytes = 30 * 1024 * 1024) {
 }
 
 /**
+ * 边下边比：拿到超过 limitBytes 就立刻中止（说明它比当前赢家大）。
+ * 返回 { buf, exceeded } —— exceeded=true 时 buf 为 null。
+ */
+async function fetchBufLimited(url, limitBytes) {
+  const res = await fetch(url, {
+    headers: { Referer: 'https://www.douyin.com/', 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const declared = Number(res.headers.get('content-length')) || 0;
+  if (declared && declared <= limitBytes) {
+    return { buf: Buffer.from(await res.arrayBuffer()), exceeded: false };
+  }
+  const chunks = [];
+  let got = 0;
+  for await (const chunk of res.body) {
+    chunks.push(chunk);
+    got += chunk.length;
+    if (got > limitBytes) {
+      try { await res.body.cancel(); } catch { /* ignore */ }
+      return { buf: null, exceeded: true, got };
+    }
+  }
+  return { buf: Buffer.concat(chunks), exceeded: false };
+}
+
+/**
  * 只问大小、不下载正文。
  * 先试 HEAD；有些 CDN 不给 HEAD，就退化成 Range: bytes=0-0，从 Content-Range 里读总大小。
  */
@@ -924,7 +951,8 @@ async function probeSize(url) {
 /**
  * 挑最大的那份候选。
  * 先用 HEAD 比大小（只问不拉，省流量），只把最大的那个真正下下来。
- * 万一某个 CDN 不支持 HEAD，就退回原地址，绝不会比原来更差。
+ * 对"探测不到大小、但来源是接口真实字段"的候选，再下载一小段比一比 ——
+ * 有些 CDN 不给 HEAD 也不给 Range，光看探测结果会漏掉真正的大图。
  */
 async function fetchBestImage(rec) {
   // 候选在采集阶段就准备好了（含所有字段 + 各自变体，并标了来源）
@@ -941,7 +969,31 @@ async function fetchBestImage(rec) {
       winner = c.url;
     }
   }
-  const buf = await fetchBuf(winner);
+
+  // 探测失败的"真实字段"候选：边下边比，超过当前赢家就当场换掉
+  let buf = null;
+  if (winnerSize > 0) {
+    const suspects = tried.filter((t) => !t.size && t.url !== winner && !/^(去模板|变体)/.test(t.from));
+    for (const c of suspects) {
+      try {
+        const part = await fetchBufLimited(c.url, winnerSize);
+        if (part.exceeded) {
+          buf = await fetchBuf(c.url);            // 它更大，整份取下来
+          winner = c.url;
+          c.size = buf.length;
+          break;
+        }
+        if (part.buf && part.buf.length > winnerSize) {
+          buf = part.buf;
+          winner = c.url;
+          winnerSize = part.buf.length;
+          c.size = part.buf.length;
+        }
+      } catch { /* 这个候选确实取不到 */ }
+    }
+  }
+
+  if (!buf) buf = await fetchBuf(winner);
   return { url: winner, buf, tried, upgraded: winner !== rec.url };
 }
 
