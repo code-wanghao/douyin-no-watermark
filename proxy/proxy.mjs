@@ -151,6 +151,8 @@ const FEATURE_DEFS = [
 ];
 const FEATURE_KEYS = FEATURE_DEFS.map((f) => f.key);
 const CONFIG_FILE = path.join(HERE, 'features.json');
+// 把本次收集到的作品地址落盘，供"粘贴链接下载"复用（跨次运行滚动累积）
+const WORKS_INDEX = path.join(HERE, 'works-index.json');
 
 let FEATURES = Object.fromEntries(FEATURE_KEYS.map((k) => [k, true]));
 
@@ -508,7 +510,7 @@ let blockedSeen = 0;        // 看到多少个"原本禁止下载"的作品
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.4.5';
+const VERSION = 'v1.5.0';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -1742,6 +1744,29 @@ async function main() {
     }
     if (unlockedTotal) {
       logOnly(`[解锁] 本次共自动解除 ${unlockedTotal} 处"禁止下载"限制`);
+    }
+    // 把收集到的作品地址滚动累积到 works-index.json，供"粘贴链接下载"复用
+    if (works.size) {
+      try {
+        let old = [];
+        try { old = JSON.parse(fs.readFileSync(WORKS_INDEX, 'utf8')); } catch { old = []; }
+        const merged = new Map((Array.isArray(old) ? old : []).map((w) => [w.awemeId, w]));
+        for (const r of works.values()) {
+          const prev = merged.get(r.awemeId) || {};
+          merged.set(r.awemeId, {
+            awemeId: r.awemeId,
+            author: r.author || prev.author || '',
+            desc: r.desc || prev.desc || '',
+            videoUrl: r.videoUrl || prev.videoUrl || '',
+            imageUrls: (r.imageUrls && r.imageUrls.length) ? r.imageUrls : (prev.imageUrls || []),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        fs.writeFileSync(WORKS_INDEX, JSON.stringify([...merged.values()].slice(-2000), null, 1), 'utf8');
+        logOnly(`[索引] 已把 ${works.size} 个作品的地址写入 ${WORKS_INDEX}（累计 ${merged.size} 个）`);
+      } catch (e) {
+        logOnly('[索引] 写入失败: ' + e.message);
+      }
     }
     if (blockedSeen && !FEATURES.aweme) {
       say('');
