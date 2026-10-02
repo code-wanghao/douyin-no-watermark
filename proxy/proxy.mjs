@@ -508,7 +508,7 @@ let blockedSeen = 0;        // 看到多少个"原本禁止下载"的作品
 const startedAt = Date.now();
 let idleNotice = false;     // 是否已经提示过"等待中"，接通后收掉
 
-const VERSION = 'v1.4.4';
+const VERSION = 'v1.4.5';
 
 function pickUrl(node) {
   if (!node) return '';
@@ -1345,9 +1345,9 @@ function handleInnerRequest(req, res) {
       let changed = 0;
       let imgCount = 0;
       let workCount = 0;
+      let json = null;
 
       if (decoded) {
-        let json = null;
         try {
           json = JSON.parse(decoded.toString('utf8'));
         } catch { json = null; }
@@ -1406,10 +1406,16 @@ function handleInnerRequest(req, res) {
       res.end(body);
 
       // 控制台只说人话；技术明细（字段数、耗时、kind）都进日志
-      logOnly(`[接口] ${kind} 改写 ${changed} 个字段`
+      // 路径 + 解析结果一定要记：出现"改写 0 个字段"时，靠它才能分清是"没这个字段"还是"根本没解析成功"
+      const topKeys = json ? Object.keys(json).slice(0, 8).join(',') : '';
+      const parseNote = json
+        ? `解析=OK 顶层键=${topKeys || '(空对象)'}`
+        : `解析失败(编码=${upstreamRes.headers['content-encoding'] || '-'} 类型=${String(upstreamRes.headers['content-type'] || '-').split(';')[0]} ${raw.length}字节)`;
+      logOnly(`[接口] ${kind} ${target.pathname}  改写 ${changed} 个字段`
         + (imgCount ? ` / ${imgCount} 张评论图` : '')
         + (workCount ? ` / ${workCount} 个作品` : '')
-        + `  累计原图 ${images.size} 张 / 作品 ${worksSeen} 个 (${Date.now() - started}ms)`);
+        + `  累计原图 ${images.size} 张 / 作品 ${worksSeen} 个`
+        + `  | ${parseNote} (${Date.now() - started}ms)`);
 
       if (idleNotice) {
         idleNotice = false;
